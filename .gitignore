@@ -1,0 +1,27 @@
+# Minecraft server files (large, binary, or auto-generated)
+mc-server/server*.jar
+mc-server/cache/
+mc-server/libraries/
+mc-server/logs/
+mc-server/world/
+mc-server/world_nether/
+mc-server/world_the_end/
+mc-server/versions/
+mc-server/plugins/
+mc-server/config/
+mc-server/server.log
+mc-server/banned-ips.json
+mc-server/banned-players.json
+mc-server/usercache.json
+mc-server/version_history.json
+mc-server/whitelist.json
+mc-server/ops.json
+
+# Bot runtime files
+mc-server/bot/node_modules/
+mc-server/bot/memory.json
+mc-server/bot/bot.log
+mc-server/bot/package-lock.json
+
+# OS
+.DS_Store
