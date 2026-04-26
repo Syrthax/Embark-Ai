@@ -6,6 +6,13 @@ const SCAN_TYPES = [
   'sand','gravel','stone','iron_ore','coal_ore','water','crafting_table','chest','dirt','grass_block',
 ]
 
+const HOSTILE_MOB_NAMES = new Set([
+  'zombie','skeleton','creeper','spider','cave_spider','witch','phantom','drowned','husk','stray',
+  'pillager','evoker','vex','vindicator','slime','magma_cube','silverfish','endermite',
+  'guardian','elder_guardian','warden','hoglin','piglin_brute','zoglin','blaze','ghast',
+  'ravager','shulker','zombified_piglin','enderman',
+])
+
 function buildGroundedState(bot, state, memory) {
   const pos = bot.entity.position
 
@@ -28,12 +35,24 @@ function buildGroundedState(bot, state, memory) {
   }
   nearbyBlocks.sort((a, b) => a.dist - b.dist)
 
-  // REAL visible entities — only from bot.entities (what server told us exists)
+  // REAL visible entities — only from bot.entities
   const entities = Object.values(bot.entities)
     .filter(e => e !== bot.entity && e.name && e.position.distanceTo(pos) < 20)
     .sort((a, b) => a.position.distanceTo(pos) - b.position.distanceTo(pos))
     .slice(0, 5)
     .map(e => ({ name: e.name, dist: Math.floor(e.position.distanceTo(pos)) }))
+
+  // REAL hostile mobs — confirmed from bot.entities
+  const hostileMobs = Object.values(bot.entities)
+    .filter(e => e.name && HOSTILE_MOB_NAMES.has(e.name) && e.position.distanceTo(pos) < 20)
+    .sort((a, b) => a.position.distanceTo(pos) - b.position.distanceTo(pos))
+    .slice(0, 3)
+    .map(e => ({ name: e.name, dist: Math.floor(e.position.distanceTo(pos)) }))
+
+  // REAL dropped items on ground — item entities from server
+  const droppedItems = Object.values(bot.entities)
+    .filter(e => e.type === 'object' && e.objectType === 'Item' && e.position.distanceTo(pos) < 20)
+  const droppedCount = droppedItems.length
 
   return {
     self: {
@@ -42,9 +61,11 @@ function buildGroundedState(bot, state, memory) {
       goal: state.goal,
       pos: { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) },
     },
-    inventory,       // from bot.inventory.items()  — real
-    nearbyBlocks,    // from bot.findBlock()         — real
-    entities,        // from bot.entities            — real
+    inventory,          // from bot.inventory.items()   — real
+    nearbyBlocks,       // from bot.findBlock()          — real
+    entities,           // from bot.entities             — real
+    hostileMobs,        // filtered to known hostile names — real
+    droppedCount,       // item entities on ground count  — real
     knownLocations: memory.locations.slice(-5).map(l => ({ name: l.name, pos: l.pos })),
   }
 }
@@ -57,10 +78,13 @@ function chatSummary(gs) {
   } else {
     parts.push('nothing notable nearby')
   }
-  if (gs.entities.length) {
+  if (gs.hostileMobs.length) {
+    parts.push(`HOSTILE: ${gs.hostileMobs.map(m => `${m.name}@${m.dist}m`).join(', ')}`)
+  } else if (gs.entities.length) {
     parts.push(gs.entities.map(e => `${e.name}@${e.dist}m`).join(', '))
   }
+  if (gs.droppedCount > 0) parts.push(`${gs.droppedCount} item(s) on ground`)
   return parts.join('; ')
 }
 
-module.exports = { buildGroundedState, chatSummary }
+module.exports = { buildGroundedState, chatSummary, HOSTILE_MOB_NAMES }
