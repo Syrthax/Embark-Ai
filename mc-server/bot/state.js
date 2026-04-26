@@ -13,7 +13,7 @@ const HOSTILE_MOB_NAMES = new Set([
   'ravager','shulker','zombified_piglin','enderman',
 ])
 
-function buildGroundedState(bot, state, memory) {
+function buildGroundedState(bot, state, memory, anger = new Map()) {
   const pos = bot.entity.position
 
   // REAL inventory — only what bot.inventory.items() returns right now
@@ -66,6 +66,7 @@ function buildGroundedState(bot, state, memory) {
     entities,           // from bot.entities             — real
     hostileMobs,        // filtered to known hostile names — real
     droppedCount,       // item entities on ground count  — real
+    anger: Array.from(anger.entries()).map(([name, rec]) => ({ name, level: rec.level })),
     knownLocations: memory.locations.slice(-5).map(l => ({ name: l.name, pos: l.pos })),
   }
 }

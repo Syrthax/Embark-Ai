@@ -23,5 +23,8 @@ mc-server/bot/memory.json
 mc-server/bot/bot.log
 mc-server/bot/package-lock.json
 
+# CLI runtime logs
+.cli-logs/
+
 # OS
 .DS_Store
