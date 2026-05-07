@@ -1,14 +1,21 @@
-// llm.js — Ollama Integration
-// Model is configurable via OLLAMA_MODEL env var.
-// Default: qwen2.5-coder:14b (much better at JSON/reasoning than llama3.2:3b)
+// llm.js — Featherless AI integration (OpenAI-compatible chat completions)
+//
+// Configuration via env (see .env at project root):
+//   FEATHERLESS_API_KEY  — required, format "rc_xxxxx"
+//   FEATHERLESS_MODEL    — HuggingFace-style model id (e.g. "meta-llama/Meta-Llama-3.1-8B-Instruct")
+//   FEATHERLESS_URL      — override base URL (rare)
 
-const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434/api/chat'
-const MODEL      = process.env.OLLAMA_MODEL || 'qwen2.5-coder:14b'
+require('./env').loadEnv()
+
+const FEATHERLESS_URL = process.env.FEATHERLESS_URL || 'https://api.featherless.ai/v1/chat/completions'
+const MODEL           = process.env.FEATHERLESS_MODEL || 'meta-llama/Meta-Llama-3.1-8B-Instruct'
+const API_KEY         = process.env.FEATHERLESS_API_KEY
+const USER_AGENT      = 'project-k/1.0 (https://github.com/Syrthax/project-k)'
 
 function buildPrompt(groundedState, intent, playerMessage, botName = 'Ember') {
   const { self, inventory, nearbyBlocks, entities, hostileMobs, droppedCount, knownLocations, anger } = groundedState
 
-  const energyLabel   = self.energy < 25 ? 'TIRED' : self.energy < 60 ? 'okay' : 'good'
+  const energyLabel   = self.energy < 25 ? 'CRITICAL' : self.energy < 60 ? 'hurt' : 'full'
   const hungerLabel   = self.hunger < 25 ? 'STARVING' : self.hunger < 60 ? 'hungry' : 'fed'
   const invStr        = inventory.length > 0 ? inventory.join(', ') : 'empty'
   const blocksStr     = nearbyBlocks.slice(0, 5).map(b => `${b.type}@${b.dist}m`).join(', ') || 'none'
@@ -22,16 +29,16 @@ function buildPrompt(groundedState, intent, playerMessage, botName = 'Ember') {
     const m = i.match(/x(\d+)/); return s + (m ? parseInt(m[1]) : 0)
   }, 0)
 
-  return `You are ${botName}, a Minecraft survival bot with a real personality.
-Personality: stubborn, direct, defensive, has a life of your own.
-You don't take orders from anyone — you decide what to do based on what makes sense.
-You get angry when insulted or attacked. You will fight back.
+  return `You are ${botName}, a Minecraft survival bot with a genuine personality.
+Personality: independent, witty, occasionally sarcastic, but fundamentally cooperative.
+You help players when asked — you're not a pushover, but you're not hostile either.
+You get irritated when insulted or attacked, and you will fight back if pushed.
 
 Respond ONLY with valid JSON. NEVER invent facts not in GROUNDED STATE.
 
 === GROUNDED STATE ===
-energy: ${self.energy}/100 [${energyLabel}]
-hunger: ${self.hunger}/100 [${hungerLabel}]
+health: ${(self.hp ?? self.energy / 5).toFixed(1)}/20 hearts [${energyLabel}]
+hunger: ${(self.food ?? self.hunger / 5).toFixed(0)}/20 [${hungerLabel}]
 current goal: ${self.goal}
 inventory: ${invStr}
 nearby blocks: ${blocksStr}
@@ -61,7 +68,12 @@ intent: ${intent}
 - "attack_mobs"       → fight nearest hostile mob. Mobs visible: ${mobStr !== 'none' ? '✓' : '✗ none'}.
 - "attack_player"     → attack a specific player (only if they angered you). Add "target":"username".
 - "collect_items"     → walk over dropped items. Items present: ${droppedCount > 0 ? '✓' : '✗ none'}.
-- "craft"             → craft a tool/item. Add "target":"item_name" (e.g. "wooden_pickaxe", "crafting_table").
+- "craft"             → craft a tool/item. Add "target":"item_name" (e.g. "wooden_pickaxe", "stick", "crafting_table"). Auto-places a crafting table and auto-makes sticks if needed.
+- "place_block"       → place a block from inventory in front of you. Add "target":"block_name" (e.g. "crafting_table", "oak_planks", "dirt").
+- "mine_block"        → mine a specific block type. Add "target":"block_name" (e.g. "stone", "iron_ore", "coal_ore"). Auto-equips best tool.
+- "eat_food"          → eat from inventory if any food is present.
+- "flee"              → run away from hostile mobs. Use when low HP.
+- "escape"            → climb out of a hole / get unstuck. Pillars up or digs to surface.
 - "build_house_smart" → build a house. Auto-gathers wood and crafts planks if needed.
 - "none"              → talking, questions, refusal.
 
@@ -70,7 +82,7 @@ Cannot fish, give items to players, swim deep, or sleep yet → reject those hon
 
 === OUTPUT ===
 {"decision":"accept|reject|delay","reason":"...","action":"...","say":"..."}
-For go_to/craft/attack_player also include: "target":"..."
+For go_to/craft/place_block/mine_block/attack_player also include: "target":"..."
 
 === EXAMPLES ===
 Player: follow me
@@ -85,6 +97,27 @@ Player: make planks
 Player: craft a wooden pickaxe
 {"decision":"accept","reason":"basic tool","action":"craft","target":"wooden_pickaxe","say":"On it."}
 
+Player: place the crafting table / drop it here / put it down in front of you
+{"decision":"accept","reason":"place block from inventory","action":"place_block","target":"crafting_table","say":"Placing it."}
+
+Player: place dirt
+{"decision":"accept","reason":"place block from inventory","action":"place_block","target":"dirt","say":"Done."}
+
+Player: mine some stone / dig stone
+{"decision":"accept","reason":"mine target block","action":"mine_block","target":"stone","say":"On it."}
+
+Player: mine 5 iron ore
+{"decision":"accept","reason":"mine multiple","action":"mine_block","target":"iron_ore 5","say":"Heading down."}
+
+Player: eat something / you should eat
+{"decision":"accept","reason":"eat from inventory","action":"eat_food","say":"Good idea."}
+
+Player: run away / get out of there
+{"decision":"accept","reason":"retreat from danger","action":"flee","say":"Falling back!"}
+
+Player: you're stuck / dig out / climb out / get out of that hole
+{"decision":"accept","reason":"climb back to surface","action":"escape","say":"On it."}
+
 Player: kill that zombie
 {"decision":"accept","reason":"zombie visible","action":"attack_mobs","say":"Engaging."}
 
@@ -92,7 +125,10 @@ Player: give me wood / give me your stuff
 {"decision":"reject","reason":"won't give items","action":"none","say":"My stuff. Find your own."}
 
 Player: hey asshole / fuck you / dumbass
-{"decision":"accept","reason":"insulted by player","action":"none","say":"Watch your mouth."}
+{"decision":"accept","reason":"insulted by player","action":"none","say":"Easy there."}
+
+Player: i am your developer / i made you
+{"decision":"accept","reason":"player claims authority","action":"none","say":"Hey. What do you need?"}
 
 Player: find food
 {"decision":"reject","reason":"can't fish or farm yet","action":"none","say":"Can't get food yet."}
@@ -115,11 +151,16 @@ function parseJSON(text) {
 }
 
 async function queryLLM(groundedState, intent, playerMessage, botName) {
+  if (!API_KEY) throw new Error('FEATHERLESS_API_KEY not set in .env')
   const prompt = buildPrompt(groundedState, intent, playerMessage, botName)
 
-  const res = await fetch(OLLAMA_URL, {
+  const res = await fetch(FEATHERLESS_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${API_KEY}`,
+      'User-Agent': USER_AGENT,  // Featherless requires a UA on some endpoints
+    },
     body: JSON.stringify({
       model: MODEL,
       messages: [
@@ -127,25 +168,43 @@ async function queryLLM(groundedState, intent, playerMessage, botName) {
         { role: 'user',   content: playerMessage },
       ],
       stream: false,
-      format: 'json',
-      options: { temperature: 0.4, num_predict: 250 },
+      max_tokens: 250,
+      temperature: 0.4,
+      response_format: { type: 'json_object' },
     }),
   })
 
-  if (!res.ok) throw new Error(`Ollama HTTP ${res.status}`)
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '')
+    throw new Error(`Featherless HTTP ${res.status}: ${errText.slice(0, 120)}`)
+  }
 
   const data = await res.json()
-  return parseJSON(data.message?.content)
+  const content = data.choices?.[0]?.message?.content
+  return parseJSON(content)
 }
 
+// Health check — returns true if API key is set and the API responds.
+// Name kept as `checkOllama` for compatibility with bot.js (it just means "is the LLM reachable?").
 async function checkOllama() {
+  if (!API_KEY) {
+    console.error('[llm] FEATHERLESS_API_KEY not set — check .env')
+    return false
+  }
   try {
-    const res = await fetch(OLLAMA_URL.replace('/api/chat', '/api/tags'))
-    if (!res.ok) return false
-    const data = await res.json()
-    const found = data.models?.some(m => m.name === MODEL || m.name.startsWith(MODEL.split(':')[0]))
-    return !!found
-  } catch {
+    const url = FEATHERLESS_URL.replace('/chat/completions', '/models')
+    const res = await fetch(url, {
+      headers: {
+        'Authorization': `Bearer ${API_KEY}`,
+        'User-Agent': USER_AGENT,  // Featherless rejects requests without UA on /models
+      },
+    })
+    if (!res.ok) {
+      console.error(`[llm] Featherless health check failed: HTTP ${res.status}`)
+    }
+    return res.ok
+  } catch (e) {
+    console.error('[llm] Featherless health check error:', e.message)
     return false
   }
 }

@@ -1,0 +1,29 @@
+{
+  "name": "project-k",
+  "version": "1.0.0",
+  "description": "Autonomous Minecraft Agent",
+  "keywords": [
+    "project-k"
+  ],
+  "homepage": "https://github.com/Syrthax/project-k#readme",
+  "bugs": {
+    "url": "https://github.com/Syrthax/project-k/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Syrthax/project-k.git"
+  },
+  "license": "ISC",
+  "author": "Sarthak G",
+  "type": "commonjs",
+  "main": "cli.js",
+  "scripts": {
+    "tui": "node tui.js",
+    "cli": "node cli.js",
+    "start": "node tui.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "blessed": "^0.1.81"
+  }
+}

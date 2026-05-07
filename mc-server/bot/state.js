@@ -56,8 +56,10 @@ function buildGroundedState(bot, state, memory, anger = new Map()) {
 
   return {
     self: {
-      energy: Math.floor(state.energy),
-      hunger: Math.floor(state.hunger),
+      hp:     bot.health,                // real Minecraft HP  (0–20)
+      food:   bot.food,                  // real Minecraft food (0–20)
+      energy: Math.floor(state.energy),  // hp mapped to 0-100 for engine compatibility
+      hunger: Math.floor(state.hunger),  // food mapped to 0-100 for engine compatibility
       goal: state.goal,
       pos: { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) },
     },

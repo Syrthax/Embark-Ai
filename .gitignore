@@ -28,3 +28,17 @@ mc-server/bot/package-lock.json
 
 # OS
 .DS_Store
+
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# Bot event log (structured logger output)
+mc-server/bot/events.jsonl
+mc-server/bot/events.jsonl.1
+
+# Node
+node_modules/
+package-lock.json
+*.tgz
