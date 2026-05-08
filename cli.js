@@ -28,6 +28,7 @@ const { spawn, execSync } = require('child_process')
 const fs         = require('fs')
 const path       = require('path')
 const https      = require('https')
+const createBotSupervisor = require('./botSupervisor')
 
 // ── Paths ────────────────────────────────────────────────────────────────────
 const ROOT       = __dirname
@@ -85,8 +86,25 @@ function tailLog(logPath, lines = 8) {
 const state = {
   serverProc: null,
   serverLogPath: path.join(LOG_DIR, 'server.log'),
-  bots: new Map(),  // name → { proc, model, logPath, startedAt }
+  bots: new Map(),  // name → { proc, model, logPath, startedAt } (legacy shape kept for status display)
 }
+
+const supervisor = createBotSupervisor({
+  botDir: BOT_DIR,
+  logDir: LOG_DIR,
+  onLog: (entry) => {
+    const clr = entry.level === 'error' ? c.red : entry.level === 'warn' ? c.yellow : c.dim
+    console.log(tag(clr, `[supervisor] ${entry.msg}`), entry)
+  },
+  onRespawn: ({ name, chainId, restartCount }) => {
+    const port = getServerPort()
+    console.log(tag(c.yellow, `[supervisor] Bot "${name}" respawning (chain ${chainId}, attempt #${restartCount}) — joining localhost:${port}`))
+  },
+  onStorm: ({ name, chainId, restartCount }) => {
+    console.log(tag(c.red, `[supervisor] RESTART STORM: bot "${name}" restarted ${restartCount}x in 10 min (chain ${chainId}). Halted — manual restart required.`))
+    state.bots.delete(name)
+  },
+})
 
 // ── Readline ─────────────────────────────────────────────────────────────────
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
@@ -273,48 +291,11 @@ function stopServer() {
 
 // ── Bot management ───────────────────────────────────────────────────────────
 
-// Programmatic spawn — used by auto-respawn after fatal desync quit.
-function spawnBotDirect(name, model) {
-  if (state.bots.has(name)) return  // already running
-  const logPath = path.join(LOG_DIR, `bot_${name}.log`)
-  const logFd   = fs.openSync(logPath, 'a')  // append so we keep the old log
-
-  const proc = spawn('node', ['bot.js'], {
-    cwd: BOT_DIR,
-    env: { ...process.env, BOT_NAME: name, FEATHERLESS_MODEL: model },
-    stdio: ['ignore', logFd, logFd],
-  })
-
-  proc.on('error', (err) => {
-    console.log(tag(c.red, `Auto-respawn of "${name}" failed: ${err.message}`))
-    state.bots.delete(name)
-  })
-
-  proc.on('exit', (code) => {
-    const b = state.bots.get(name)
-    const uptime = b ? Date.now() - b.startedAt : 0
-    state.bots.delete(name)
-    if (b && code !== 0 && code !== null) {
-      console.log(tag(c.red, `Bot "${name}" crashed on respawn (code ${code}). Manual restart required.`))
-      tailLog(logPath)
-    } else if (b && code === 0 && uptime > 60000) {
-      console.log(tag(c.yellow, `Bot "${name}" disconnected again — auto-respawning...`))
-      spawnBotDirect(name, model)
-    } else {
-      console.log(tag(c.gray, `Bot "${name}" stopped`))
-    }
-  })
-
-  state.bots.set(name, { proc, model, logPath, startedAt: Date.now() })
-  const port = getServerPort()
-  console.log(tag(c.green, `Bot "${name}" respawned — joining localhost:${port} with ${model}`))
-}
-
 async function spawnBot() {
   const name = (await prompt(`${c.bold}Bot name${c.reset} (default Ember): `)).trim() || 'Ember'
 
-  if (state.bots.has(name)) {
-    console.log(tag(c.red, `A bot named "${name}" is already running.`))
+  if (supervisor.has(name)) {
+    console.log(tag(c.red, `A bot named "${name}" is already managed by the supervisor.`))
     return
   }
 
@@ -334,106 +315,54 @@ async function spawnBot() {
   if (!model) { console.log(tag(c.red, 'Invalid selection.')); return }
 
   const logPath = path.join(LOG_DIR, `bot_${name}.log`)
-  const logFd = fs.openSync(logPath, 'w')
 
-  const proc = spawn('node', ['bot.js'], {
-    cwd: BOT_DIR,
-    env: { ...process.env, BOT_NAME: name, FEATHERLESS_MODEL: model },
-    stdio: ['ignore', logFd, logFd],
-  })
-
-  proc.on('error', (err) => {
-    console.log(tag(c.red, `Failed to start bot "${name}": ${err.message}`))
-    state.bots.delete(name)
-  })
-
-  proc.on('exit', (code) => {
-    const b = state.bots.get(name)
-    const uptime = b ? Date.now() - b.startedAt : 0
-    state.bots.delete(name)
-
-    if (b && code !== 0 && code !== null) {
-      console.log(tag(c.red, `Bot "${name}" crashed (code ${code}). Last log output:`))
-      tailLog(logPath)
-    } else if (b && code === 0 && uptime > 60000) {
-      // Clean exit after >60s uptime — likely a fatal desync quit from fatalDesyncRecovery.js.
-      // Auto-respawn so the bot recovers without manual intervention.
-      console.log(tag(c.yellow, `Bot "${name}" disconnected (fatal desync) — auto-respawning...`))
-      spawnBotDirect(name, b.model)
-    } else {
-      console.log(tag(c.gray, `Bot "${name}" stopped`))
-    }
-  })
-
-  state.bots.set(name, { proc, model, logPath, startedAt: Date.now() })
+  supervisor.launch(name, model, logPath, { fresh: true })
 
   const port = getServerPort()
   console.log(tag(c.green, `Bot "${name}" started — joining localhost:${port} with ${model}`))
   console.log(tag(c.dim, `Logs: ${logPath}`))
+  console.log(tag(c.dim, 'Supervisor will auto-respawn on disconnects with exponential backoff.'))
 }
 
 async function stopBot() {
-  if (state.bots.size === 0) { console.log(tag(c.yellow, 'No bots running.')); return }
+  const sv = supervisor.getState()
+  const names = Object.keys(sv)
+  if (!names.length) { console.log(tag(c.yellow, 'No bots running.')); return }
 
-  const names = Array.from(state.bots.keys())
   console.log(`${c.bold}Active bots:${c.reset}`)
-  names.forEach((n, i) => console.log(`  ${c.cyan}[${i+1}]${c.reset} ${n} (${state.bots.get(n).model})`))
+  names.forEach((n, i) => console.log(`  ${c.cyan}[${i+1}]${c.reset} ${n} (${sv[n].model})`))
 
   const idxRaw = await prompt('Select bot # to stop: ')
   const idx = parseInt(idxRaw) - 1
   const name = names[idx]
   if (!name) { console.log(tag(c.red, 'Invalid selection.')); return }
 
-  const bot = state.bots.get(name)
-  console.log(tag(c.cyan, `Stopping ${name}...`))
-  try { bot.proc.kill('SIGTERM') } catch (e) {
-    console.log(tag(c.red, `Failed: ${e.message}`))
-  }
+  console.log(tag(c.cyan, `Stopping ${name} (supervisor will not respawn)...`))
+  supervisor.stop(name)
 }
 
 async function restartBot() {
-  if (state.bots.size === 0) { console.log(tag(c.yellow, 'No bots running.')); return }
+  const sv = supervisor.getState()
+  const names = Object.keys(sv)
+  if (!names.length) { console.log(tag(c.yellow, 'No bots running.')); return }
 
-  const names = Array.from(state.bots.keys())
   console.log(`${c.bold}Active bots:${c.reset}`)
-  names.forEach((n, i) => console.log(`  ${c.cyan}[${i+1}]${c.reset} ${n} (${state.bots.get(n).model})`))
+  names.forEach((n, i) => console.log(`  ${c.cyan}[${i+1}]${c.reset} ${n} (${sv[n].model})`))
 
   const idxRaw = await prompt('Select bot # to restart: ')
   const idx = parseInt(idxRaw) - 1
   const name = names[idx]
   if (!name) { console.log(tag(c.red, 'Invalid selection.')); return }
 
-  const oldBot = state.bots.get(name)
-  const model = oldBot.model
-  console.log(tag(c.cyan, `Restarting ${name}...`))
+  const { model } = sv[name]
+  console.log(tag(c.cyan, `Restarting ${name} (clean chain)...`))
 
-  oldBot.proc.kill('SIGTERM')
-  await new Promise(res => setTimeout(res, 1500))
+  supervisor.stop(name)
+  await new Promise(r => setTimeout(r, 1500))
 
   const logPath = path.join(LOG_DIR, `bot_${name}.log`)
-  const logFd = fs.openSync(logPath, 'w')
-  const proc = spawn('node', ['bot.js'], {
-    cwd: BOT_DIR,
-    env: { ...process.env, BOT_NAME: name, FEATHERLESS_MODEL: model },
-    stdio: ['ignore', logFd, logFd],
-  })
+  supervisor.launch(name, model, logPath, { fresh: true })
 
-  proc.on('error', (err) => {
-    console.log(tag(c.red, `Failed to restart "${name}": ${err.message}`))
-    state.bots.delete(name)
-  })
-
-  proc.on('exit', (code) => {
-    if (code !== 0 && code !== null) {
-      console.log(tag(c.red, `Bot "${name}" crashed (code ${code}). Last log output:`))
-      tailLog(logPath)
-    } else {
-      console.log(tag(c.gray, `Bot "${name}" stopped`))
-    }
-    state.bots.delete(name)
-  })
-
-  state.bots.set(name, { proc, model, logPath, startedAt: Date.now() })
   const port = getServerPort()
   console.log(tag(c.green, `Bot "${name}" restarted — joining localhost:${port}`))
 }
@@ -442,7 +371,7 @@ async function restartBot() {
 async function viewLogs() {
   const sources = []
   if (state.serverProc) sources.push({ label: 'Server', path: state.serverLogPath })
-  for (const [name, b] of state.bots) sources.push({ label: `Bot: ${name}`, path: b.logPath })
+  for (const [name, b] of Object.entries(supervisor.getState())) sources.push({ label: `Bot: ${name}`, path: b.logPath })
 
   if (!sources.length) { console.log(tag(c.yellow, 'No active processes.')); return }
 
@@ -644,13 +573,18 @@ function header() {
   }
   console.log(`${c.bold}Server:${c.reset} ${serverDot} ${serverInfo}`)
 
-  console.log(`${c.bold}Bots:${c.reset}   ${state.bots.size === 0 ? c.gray + 'none' + c.reset : ''}`)
-  for (const [name, b] of state.bots) {
-    const uptime = Math.floor((Date.now() - b.startedAt) / 1000)
-    const mins = Math.floor(uptime / 60)
-    const secs = uptime % 60
+  const sv = supervisor.getState()
+  const svNames = Object.keys(sv)
+  console.log(`${c.bold}Bots:${c.reset}   ${svNames.length === 0 ? c.gray + 'none' + c.reset : ''}`)
+  for (const [name, b] of Object.entries(sv)) {
+    const uptimeSec = Math.floor((b.uptimeMs || 0) / 1000)
+    const mins = Math.floor(uptimeSec / 60)
+    const secs = uptimeSec % 60
     const uptimeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`
-    console.log(`  ${c.green}●${c.reset} ${c.bold}${name}${c.reset} ${c.dim}(${b.model}, up ${uptimeStr})${c.reset}`)
+    const dot = b.running ? `${c.green}●${c.reset}` : b.awaitingRespawn ? `${c.yellow}○${c.reset}` : `${c.gray}○${c.reset}`
+    const restartNote = b.restartCount > 0 ? ` [restarts: ${b.restartCount}, chain: ${b.chainId}]` : ''
+    const waitNote = b.awaitingRespawn ? ` ${c.yellow}(respawning...)${c.reset}` : ''
+    console.log(`  ${dot} ${c.bold}${name}${c.reset} ${c.dim}(${b.model}, up ${uptimeStr}${restartNote})${c.reset}${waitNote}`)
   }
   console.log()
 }
@@ -698,8 +632,8 @@ async function loop() {
 
 async function cleanup() {
   console.log(tag(c.cyan, 'Shutting down all processes...'))
-  for (const [name, b] of state.bots) {
-    try { b.proc.kill('SIGTERM') } catch {}
+  for (const name of Object.keys(supervisor.getState())) {
+    supervisor.stop(name)
     console.log(tag(c.gray, `  stopped bot ${name}`))
   }
   if (state.serverProc) {

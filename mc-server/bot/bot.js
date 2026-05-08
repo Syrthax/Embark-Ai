@@ -1,6 +1,9 @@
 // Load .env from project root before anything else (Featherless API key, model)
 require('./env').loadEnv()
 
+const fs   = require('fs')
+const path = require('path')
+
 const mineflayer = require('mineflayer')
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
 const { plugin: pvp } = require('mineflayer-pvp')
@@ -166,7 +169,11 @@ function pumpChat() {
 bot.once('spawn', async () => {
   log.info('spawned', {
     pos: { x: Math.floor(bot.entity.position.x), y: Math.floor(bot.entity.position.y), z: Math.floor(bot.entity.position.z) },
+    ...(RECOVERY_CHAIN_ID && { chainId: RECOVERY_CHAIN_ID }),
   })
+  if (RECOVERY_CHAIN_ID) {
+    log.info('recovery_chain_active', { chainId: RECOVERY_CHAIN_ID })
+  }
   llmEnabled = await checkOllama()
   log.info('llm_check', { model: getModelName(), connected: llmEnabled })
 
@@ -194,6 +201,26 @@ bot.once('spawn', async () => {
   startFreezeForensics()
   startHealthBeacon()
   createFatalDesyncRecovery(bot, liveness, log)
+
+  // Post-spawn integrity check: confirm entity liveness reaches LIVE_VALID within 30s.
+  // A failure here means position/entity data never arrived — likely a login-phase desync.
+  const integrityStart = Date.now()
+  const integrityCheck = setInterval(() => {
+    if (liveness.getState() === 'LIVE_VALID') {
+      clearInterval(integrityCheck)
+      log.info('spawn_integrity_ok', {
+        checkMs: Date.now() - integrityStart,
+        ...(RECOVERY_CHAIN_ID && { chainId: RECOVERY_CHAIN_ID }),
+      })
+    } else if (Date.now() - integrityStart > 30_000) {
+      clearInterval(integrityCheck)
+      log.warn('spawn_integrity_fail', {
+        livenessState: liveness.getState(),
+        checkMs: 30_000,
+        ...(RECOVERY_CHAIN_ID && { chainId: RECOVERY_CHAIN_ID }),
+      })
+    }
+  }, 1_000)
 })
 
 // ── Reconciliation Watchdog ──────────────────────────────────────────────────
@@ -2389,23 +2416,50 @@ bot.on('chat', (username, message) => {
   }
 })
 
+// ── Exit reason persistence ───────────────────────────────────────────────────
+// Written before each exit so botSupervisor.js can classify the restart.
+// Consumed (and deleted) by the supervisor on the next launch.
+
+const EXIT_REASON_PATH = path.join(__dirname, 'exit_reason.json')
+const RECOVERY_CHAIN_ID = process.env.RECOVERY_CHAIN_ID || null
+
+function writeExitReason(reason) {
+  try {
+    fs.writeFileSync(EXIT_REASON_PATH, JSON.stringify({
+      reason,
+      exitAt:          Date.now(),
+      livenessState:   liveness?.getState() || null,
+      chainId:         RECOVERY_CHAIN_ID,
+    }))
+  } catch {}
+}
+
 // ── Errors / shutdown ─────────────────────────────────────────────────────────
 
 bot.on('error', err => {
   log.error('socket_error', { message: err.message })
 })
 bot.on('kicked', reason => {
-  log.fatal('kicked', { reason: typeof reason === 'string' ? reason : JSON.stringify(reason) })
+  const r = typeof reason === 'string' ? reason : JSON.stringify(reason)
+  log.fatal('kicked', { reason: r })
+  writeExitReason('kicked')
   setTimeout(() => process.exit(0), 200)  // give logger time to flush
 })
 bot.on('end', reason => {
-  log.warn('disconnected', { reason: String(reason) })
+  const r = String(reason)
+  log.warn('disconnected', { reason: r })
+  const livenessState = liveness?.getState()
+  const exitClass = (livenessState === 'LIVE_FATAL' || r === 'disconnect.quitting')
+    ? 'entity_desync'
+    : 'server_disconnect'
+  writeExitReason(exitClass)
   setTimeout(() => process.exit(0), 200)
 })
 
 process.on('uncaughtException',  err => {
   log.fatal('uncaught_exception', { message: err.message, stack: err.stack })
   safeChat(`Crash: ${err.message.slice(0,80)}`)
+  writeExitReason('crash')
   setTimeout(() => process.exit(1), 500)
 })
 process.on('unhandledRejection', err => {

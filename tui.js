@@ -48,6 +48,7 @@ const fs    = require('fs')
 const path  = require('path')
 const https = require('https')
 const readline = require('readline')
+const createBotSupervisor = require('./botSupervisor')
 
 // ── Paths & constants ────────────────────────────────────────────────────────
 const ROOT       = __dirname
@@ -63,11 +64,14 @@ if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true })
 const state = {
   serverProc: null,
   serverLogPath: path.join(LOG_DIR, 'server.log'),
-  bots: new Map(),       // name → { proc, model, logPath, startedAt }
   selectedBot: null,     // name of bot currently displayed in status panel
   botStates: new Map(),  // name → latest 'state' event from events.jsonl
   eventsFollowOffset: 0, // file position for tail-following events.jsonl
 }
+
+// Supervisor is initialized after logPanel is available so onLog can write there.
+// Declared here; bound below after screen setup.
+let supervisor = null
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function getServerPort() {
@@ -224,6 +228,27 @@ const statusBar = blessed.box({
   padding: { left: 1, right: 1 },
 })
 
+// ── Supervisor ───────────────────────────────────────────────────────────────
+supervisor = createBotSupervisor({
+  botDir: BOT_DIR,
+  logDir: LOG_DIR,
+  onLog: (entry) => {
+    const clr = entry.level === 'error' ? '{red-fg}' : entry.level === 'warn' ? '{yellow-fg}' : '{gray-fg}'
+    logPanel.log(`${clr}[supervisor] ${entry.msg}{/}`)
+  },
+  onRespawn: ({ name, chainId, restartCount }) => {
+    const port = getServerPort()
+    logPanel.log(`{yellow-fg}[supervisor] Bot "${name}" respawning (chain ${chainId}, attempt #${restartCount}) — localhost:${port}{/}`)
+    refresh()
+  },
+  onStorm: ({ name, chainId, restartCount }) => {
+    logPanel.log(`{red-fg}[supervisor] RESTART STORM: bot "${name}" restarted ${restartCount}x in 10 min (chain ${chainId}). Halted.{/}`)
+    state.botStates.delete(name)
+    if (state.selectedBot === name) state.selectedBot = null
+    refresh()
+  },
+})
+
 // ── Rendering ────────────────────────────────────────────────────────────────
 function renderHeader() {
   const port = getServerPort()
@@ -236,16 +261,20 @@ function renderHeader() {
     serverLine = `{gray-fg}○{/} Server  {gray-fg}stopped{/}`
   }
 
+  const sv = supervisor ? supervisor.getState() : {}
+  const svNames = Object.keys(sv)
   let botsLine
-  if (state.bots.size === 0) {
+  if (!svNames.length) {
     botsLine = '{gray-fg}no bots running{/}'
   } else {
     const items = []
-    for (const [name, b] of state.bots) {
-      const up = Math.floor((Date.now() - b.startedAt) / 1000)
+    for (const [name, b] of Object.entries(sv)) {
+      const up = Math.floor((b.uptimeMs || 0) / 1000)
       const upStr = up >= 60 ? `${Math.floor(up / 60)}m${up % 60}s` : `${up}s`
-      const marker = name === state.selectedBot ? `{green-fg}●{/}` : `{cyan-fg}●{/}`
-      items.push(`${marker} {bold}${name}{/bold} {gray-fg}(${b.model}, ${upStr}){/}`)
+      const dot = b.running ? (name === state.selectedBot ? `{green-fg}●{/}` : `{cyan-fg}●{/}`)
+                : b.awaitingRespawn ? `{yellow-fg}○{/}` : `{gray-fg}○{/}`
+      const restarts = b.restartCount > 0 ? ` {yellow-fg}[${b.restartCount}↺]{/}` : ''
+      items.push(`${dot} {bold}${name}{/bold} {gray-fg}(${b.model}, ${upStr}){/}${restarts}`)
     }
     botsLine = items.join('   ')
   }
@@ -332,7 +361,7 @@ function renderStatusBar(message) {
     statusBar.setContent(`{bold}${message}{/}`)
   } else {
     const port = getServerPort()
-    const hint = state.bots.size === 0 && !state.serverProc && !isPortInUse(port)
+    const hint = (!supervisor || !Object.keys(supervisor.getState()).length) && !state.serverProc && !isPortInUse(port)
       ? '{yellow-fg}Press [1] to start the server, then [3] to spawn a bot.{/}'
       : 'Press a key to act, or [q] to quit.'
     statusBar.setContent(hint)
@@ -558,8 +587,8 @@ async function actSpawnBot() {
   if (name === null) return
   const botName = name.trim() || 'Ember'
 
-  if (state.bots.has(botName)) {
-    return modalMessage(`{red-fg}Bot "${botName}" already running.{/}`, 'red')
+  if (supervisor.has(botName)) {
+    return modalMessage(`{red-fg}Bot "${botName}" already managed by supervisor.{/}`, 'red')
   }
 
   if (!process.env.FEATHERLESS_API_KEY) {
@@ -571,83 +600,51 @@ async function actSpawnBot() {
   if (!model) return
 
   const logPath = path.join(LOG_DIR, `bot_${botName}.log`)
-  const logFd = fs.openSync(logPath, 'w')
-  const proc = spawn('node', ['bot.js'], {
-    cwd: BOT_DIR,
-    env: { ...process.env, BOT_NAME: botName, FEATHERLESS_MODEL: model },
-    stdio: ['ignore', logFd, logFd],
-  })
+  supervisor.launch(botName, model, logPath, { fresh: true })
 
-  proc.on('error', (err) => {
-    logPanel.log(`{red-fg}Bot "${botName}" failed: ${err.message}{/}`)
-    state.bots.delete(botName)
-    refresh()
-  })
-  proc.on('exit', (code) => {
-    if (code !== 0 && code !== null) {
-      logPanel.log(`{red-fg}Bot "${botName}" crashed (code ${code}){/}`)
-    } else {
-      logPanel.log(`{gray-fg}Bot "${botName}" stopped{/}`)
-    }
-    state.bots.delete(botName)
-    state.botStates.delete(botName)
-    if (state.selectedBot === botName) state.selectedBot = state.bots.keys().next().value || null
-    refresh()
-  })
-
-  state.bots.set(botName, { proc, model, logPath, startedAt: Date.now() })
   state.selectedBot = botName
-  logPanel.log(`{green-fg}Bot "${botName}" starting with ${model}{/}`)
+  logPanel.log(`{green-fg}Bot "${botName}" starting with ${model} (supervised){/}`)
   refresh()
 }
 
 async function actStopBot() {
-  if (state.bots.size === 0) return modalMessage('{yellow-fg}No bots running.{/}')
-  const items = [...state.bots.entries()].map(([name, b]) => ({ label: `${name} (${b.model})`, value: name }))
+  const sv = supervisor.getState()
+  const names = Object.keys(sv)
+  if (!names.length) return modalMessage('{yellow-fg}No bots running.{/}')
+  const items = names.map(n => ({ label: `${n} (${sv[n].model})`, value: n }))
   const name = await modalSelect('Stop which bot?', items)
   if (!name) return
-  const bot = state.bots.get(name)
-  if (!bot) return
-  try { bot.proc.kill('SIGTERM') } catch (e) {
-    return modalMessage(`{red-fg}Kill failed: ${e.message}{/}`, 'red')
-  }
-  logPanel.log(`{cyan-fg}Stopping ${name}...{/}`)
+  supervisor.stop(name)
+  state.botStates.delete(name)
+  if (state.selectedBot === name) state.selectedBot = Object.keys(supervisor.getState()).find(n => n !== name) || null
+  logPanel.log(`{cyan-fg}Stopping ${name} (supervisor disabled){/}`)
+  refresh()
 }
 
 async function actRestartBot() {
-  if (state.bots.size === 0) return modalMessage('{yellow-fg}No bots running.{/}')
-  const items = [...state.bots.entries()].map(([name, b]) => ({ label: `${name} (${b.model})`, value: name }))
+  const sv = supervisor.getState()
+  const names = Object.keys(sv)
+  if (!names.length) return modalMessage('{yellow-fg}No bots running.{/}')
+  const items = names.map(n => ({ label: `${n} (${sv[n].model})`, value: n }))
   const name = await modalSelect('Restart which bot?', items)
   if (!name) return
-  const old = state.bots.get(name)
-  const model = old.model
-  try { old.proc.kill('SIGTERM') } catch {}
+  const { model } = sv[name]
+  supervisor.stop(name)
   await new Promise(r => setTimeout(r, 1500))
 
   const logPath = path.join(LOG_DIR, `bot_${name}.log`)
-  const logFd = fs.openSync(logPath, 'w')
-  const proc = spawn('node', ['bot.js'], {
-    cwd: BOT_DIR,
-    env: { ...process.env, BOT_NAME: name, FEATHERLESS_MODEL: model },
-    stdio: ['ignore', logFd, logFd],
-  })
-  proc.on('exit', (code) => {
-    if (code !== 0 && code !== null) logPanel.log(`{red-fg}Bot "${name}" crashed (code ${code}){/}`)
-    else logPanel.log(`{gray-fg}Bot "${name}" stopped{/}`)
-    state.bots.delete(name)
-    state.botStates.delete(name)
-    if (state.selectedBot === name) state.selectedBot = state.bots.keys().next().value || null
-    refresh()
-  })
-  state.bots.set(name, { proc, model, logPath, startedAt: Date.now() })
+  supervisor.launch(name, model, logPath, { fresh: true })
+
   state.selectedBot = name
-  logPanel.log(`{green-fg}Bot "${name}" restarted{/}`)
+  logPanel.log(`{green-fg}Bot "${name}" restarted (clean chain){/}`)
   refresh()
 }
 
 async function actSwitchBot() {
-  if (state.bots.size === 0) return modalMessage('{yellow-fg}No bots running.{/}')
-  const items = [...state.bots.keys()].map(n => ({ label: n + (n === state.selectedBot ? ' (active)' : ''), value: n }))
+  const sv = supervisor.getState()
+  const names = Object.keys(sv)
+  if (!names.length) return modalMessage('{yellow-fg}No bots running.{/}')
+  const items = names.map(n => ({ label: n + (n === state.selectedBot ? ' (active)' : ''), value: n }))
   const name = await modalSelect('Show which bot in status panel?', items)
   if (!name) return
   state.selectedBot = name
@@ -753,8 +750,8 @@ async function actWorldSettings() {
 // ── Cleanup & quit ───────────────────────────────────────────────────────────
 async function quit() {
   refresh('{yellow-fg}Shutting down...{/}')
-  for (const [, b] of state.bots) {
-    try { b.proc.kill('SIGTERM') } catch {}
+  for (const name of Object.keys(supervisor.getState())) {
+    supervisor.stop(name)
   }
   if (state.serverProc) {
     try { state.serverProc.kill('SIGTERM') } catch {}
