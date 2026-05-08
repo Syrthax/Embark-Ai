@@ -20,6 +20,8 @@ const createFatalDesyncRecovery      = require('./fatalDesyncRecovery')
 const createMovementController       = require('./movementController')
 const createGoalRegistry             = require('./goalRegistry')
 const createRecoveryEngine           = require('./recoveryEngine')
+const createEnvironmentPerception    = require('./environmentPerception')
+const createLocomotionRecovery       = require('./locomotionRecovery')
 
 // ── Configuration via env ─────────────────────────────────────────────────────
 const BOT_NAME    = process.env.BOT_NAME    || 'Ember'
@@ -192,6 +194,9 @@ bot.once('spawn', async () => {
     taskExplore,
   })
 
+  envPerception      = createEnvironmentPerception(bot, log)
+  locomotionRecovery = createLocomotionRecovery(bot, log)
+
   startStateLoop()
   startAgentLoop()
   startThreatLoop()
@@ -200,6 +205,7 @@ bot.once('spawn', async () => {
   startReconciliationWatchdog()
   startFreezeForensics()
   startHealthBeacon()
+  startPerceptionLoop()
   createFatalDesyncRecovery(bot, liveness, log)
 
   // Post-spawn integrity check: confirm entity liveness reaches LIVE_VALID within 30s.
@@ -230,8 +236,14 @@ bot.once('spawn', async () => {
 //   - goal === 'attacking' but pvp is not engaged
 //   - state has a followTarget but goal is idle (handled by agent loop's auto-resume too)
 //   - taskBusy stuck true with no watchdog
-let recoveryAttempts = 0
-let recoveryEngine   = null  // initialized in spawn handler after task functions are available
+let recoveryAttempts    = 0
+let recoveryEngine      = null  // initialized in spawn handler after task functions are available
+let envPerception       = null  // initialized in spawn handler
+let locomotionRecovery  = null  // initialized in spawn handler
+
+// Last full environment scan — refreshed every PERCEPTION_INTERVAL_MS
+let lastEnvScan         = null
+const PERCEPTION_INTERVAL_MS = 3000  // scan every 3s; scanning is cheap (local blockAt calls)
 
 function startReconciliationWatchdog() {
   setInterval(() => {
@@ -354,6 +366,12 @@ function buildFreezeSnapshot(reason) {
     // Recovery state
     recoveryState:    recoveryEngine?.getState() || null,
     movementOwner:    movement.getOwner(),
+
+    // Environmental perception
+    envRisk:          lastEnvScan?.locomotionRisk ?? null,
+    envStuckClass:    lastEnvScan?.stuckClass     ?? null,
+    envHazards:       lastEnvScan?.hazardSummary  ?? null,
+    envIsEnclosed:    lastEnvScan?.isEnclosed      ?? null,
 
     // Tracing
     cid: ctx?.correlationId || null,
@@ -723,7 +741,16 @@ function reactToMobAttack(mob) {
 
 function reactToEnvironmental(hazard) {
   rememberHazard(hazard)
-  log.info('hazard_identified', { name: hazard?.name || 'unknown', knownZones: hazardZones.length })
+  // Also record in the environmental perception hazard memory for path avoidance
+  if (hazard?.block?.position && envPerception) {
+    const hp = hazard.block.position
+    envPerception.recordHazardPosition(hp.x, hp.y, hp.z, 'damage')
+  }
+  log.info('hazard_detected', {
+    name: hazard?.name || 'unknown',
+    knownZones: hazardZones.length,
+    envRisk: lastEnvScan?.locomotionRisk ?? null,
+  })
   replaceTask('evading', () => taskEvadeHazard(hazard))
 }
 
@@ -1567,28 +1594,61 @@ async function taskEscape() {
   try { p = await awaitValidPosition(2000) }
   catch (e) { log.warn('escape_skip_invalid_position', { reason: e.message }); safeChat("Can't escape yet."); return }
 
-  const startY = Math.floor(p.y)
-  const targetY = Math.min(75, startY + 15)
-  log.info('escape_start', { from: { x: Math.floor(p.x), y: startY, z: Math.floor(p.z) }, targetY })
-  safeChat('Stuck — climbing out.')
+  // Get current perception to classify stuck state and orient escape
+  const scan = lastEnvScan || (envPerception ? envPerception.scan() : null)
+  const stuckClass = scan?.stuckClass || 'unknown'
 
-  // Try multiple nearby surface targets — first straight up, then radial offsets
-  const cx = Math.floor(p.x), cz = Math.floor(p.z)
+  log.info('escape_start', {
+    from: { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) },
+    stuckClass,
+    locomotionRisk: scan?.locomotionRisk ?? null,
+    hazardSummary:  scan?.hazardSummary  ?? null,
+  })
+  safeChat('Stuck — escaping.')
+
+  // Phase 1: locomotion micro-escape first (fast, no pathfinder)
+  if (locomotionRecovery && scan) {
+    log.info('escape_attempt', { method: 'locomotion_phase', stuckClass })
+    await locomotionRecovery.runHazardEscape(stuckClass, scan, 'task_escape')
+    await new Promise(r => setTimeout(r, 300))
+  }
+
+  // Re-read position after locomotion phase
+  const p2 = bot.entity?.position
+  if (!isValidVec(p2)) {
+    log.warn('escape_position_invalid_after_locomotion')
+    return
+  }
+
+  const startY = Math.floor(p2.y)
+  const targetY = Math.min(75, startY + 15)
+
+  // Phase 2: pathfinder escape — prefer escape-vector direction if known
+  const ev = scan?.escapeVector
+  const cx  = Math.floor(p2.x)
+  const cz  = Math.floor(p2.z)
+
   const attempts = [
-    { x: cx,     z: cz,     y: targetY },
+    { x: cx, z: cz, y: targetY },  // straight up
+    // Escape-vector-biased targets first
+    ...(ev ? [
+      { x: cx + ev.dx * 6, z: cz + ev.dz * 6, y: targetY },
+      { x: cx + ev.dx * 4, z: cz + ev.dz * 4, y: startY  },
+    ] : []),
     { x: cx + 6, z: cz,     y: targetY },
     { x: cx - 6, z: cz,     y: targetY },
     { x: cx,     z: cz + 6, y: targetY },
     { x: cx,     z: cz - 6, y: targetY },
   ]
 
-  movement.setThinkingTimeout(5000)  // give pathfinder more time to plan dig/place
+  movement.setThinkingTimeout(5000)
   try {
     for (const a of attempts) {
+      if (!isFiniteNum(a.x) || !isFiniteNum(a.y) || !isFiniteNum(a.z)) continue
       try {
-        await navNear(a.x, a.y, a.z, 3)
+        await navNear(Math.floor(a.x), Math.floor(a.y), Math.floor(a.z), 3)
         const newY = Math.floor(bot.entity.position.y)
-        log.info('escape_complete', { reached: a, newY })
+        log.info('escape_complete', { method: 'pathfinder', reached: a, newY, stuckClass })
         safeChat('Out!')
         return
       } catch (e) {
@@ -1599,8 +1659,8 @@ async function taskEscape() {
     movement.restoreThinkingTimeout()
   }
 
-  // Last resort: dig straight up
-  log.warn('escape_falling_back_to_dig_up')
+  // Phase 3: dig up as last resort
+  log.warn('escape_falling_back_to_dig_up', { stuckClass })
   await digUp(12)
   log.info('escape_complete', { method: 'dig_up', endY: Math.floor(bot.entity.position.y) })
 }
@@ -1866,7 +1926,7 @@ function tryAutonomous() {
     return
   }
 
-  const gs     = buildGroundedState(bot, state, memory, anger)
+  const gs     = buildGroundedState(bot, state, memory, anger, envPerception)
   const choice = selectAutonomousGoal(gs)
 
   if (choice) {
@@ -1910,9 +1970,52 @@ function startHealthBeacon() {
       hp:   bot.health,
       food: bot.food,
       goal: state.goal,
+      envRisk:      lastEnvScan?.locomotionRisk ?? null,
+      envStuck:     lastEnvScan?.stuckClass     ?? null,
+      envHazards:   lastEnvScan?.hazardSummary  ?? null,
       cid:  ctx?.correlationId || null,
     })
   }, 10_000)
+}
+
+// ── Perception Loop ───────────────────────────────────────────────────────────
+// Continuously refreshes lastEnvScan so it is available to tasks, the LLM,
+// freeze forensics, and recovery without blocking event loop with repeated scans.
+// Also fires automatic hazard escape when in critical danger and not already busy.
+
+const LAVA_ESCAPE_COOLDOWN_MS = 8000
+let lastLavaEscapeAt = 0
+
+function startPerceptionLoop() {
+  setInterval(() => {
+    if (!envPerception) return
+    try {
+      lastEnvScan = envPerception.scan()
+    } catch (e) {
+      log.debug('perception_scan_error', { message: e.message })
+      return
+    }
+
+    // Auto-trigger hazard escape when standing in lava and not already reacting
+    if (lastEnvScan.feetBlock === 'lava' || lastEnvScan.headBlock === 'lava') {
+      const now = Date.now()
+      if (!taskBusy && now - lastLavaEscapeAt > LAVA_ESCAPE_COOLDOWN_MS) {
+        lastLavaEscapeAt = now
+        log.warn('hazard_detected', { type: 'lava', feetBlock: lastEnvScan.feetBlock })
+        locomotionRecovery.runHazardEscape('lava_immobilization', lastEnvScan, 'auto_lava').catch(() => {})
+      }
+    }
+
+    // Log high-risk situations for postmortem visibility
+    if (lastEnvScan.locomotionRisk >= 8) {
+      log.warn('hazard_detected', {
+        risk: lastEnvScan.locomotionRisk,
+        stuckClass: lastEnvScan.stuckClass,
+        hazardSummary: lastEnvScan.hazardSummary,
+        isEnclosed: lastEnvScan.isEnclosed,
+      })
+    }
+  }, PERCEPTION_INTERVAL_MS)
 }
 
 const ACTIVITY_TIMEOUT_MS = 5 * 60 * 1000  // 5 minutes
@@ -1938,17 +2041,27 @@ function startActivityWatchdog() {
 // This breaks the "validator dead-end" failure where the bot stands still dying
 // because all damage events are dropped due to stale position cache (diagnosis F18).
 async function taskBlindSurvival() {
-  log.warn('blind_survival_start', { livenessState: liveness.getState() })
-  safeChat('Taking hits. Moving blind.')
-  const angle = Math.random() * Math.PI * 2
-  try { bot.entity.yaw = angle } catch {}
-  bot.setControlState('forward', true)
-  bot.setControlState('sprint', true)
-  bot.setControlState('jump', true)
-  await new Promise(r => setTimeout(r, 400))
-  bot.setControlState('jump', false)
-  await new Promise(r => setTimeout(r, 1600))
-  bot.clearControlStates()
+  const scan  = lastEnvScan || (envPerception ? envPerception.scan() : null)
+  const stuck = scan?.stuckClass || 'unknown'
+  log.warn('blind_survival_start', { livenessState: liveness.getState(), stuckClass: stuck, risk: scan?.locomotionRisk ?? null })
+  safeChat('Taking hits. Moving.')
+
+  if (locomotionRecovery && scan) {
+    // Use perception-aware escape rather than random yaw
+    await locomotionRecovery.runHazardEscape(stuck, scan, 'blind_survival')
+  } else {
+    // Fallback: random direction sprint
+    const angle = Math.random() * Math.PI * 2
+    try { bot.entity.yaw = angle } catch {}
+    bot.setControlState('forward', true)
+    bot.setControlState('sprint', true)
+    bot.setControlState('jump', true)
+    await new Promise(r => setTimeout(r, 400))
+    bot.setControlState('jump', false)
+    await new Promise(r => setTimeout(r, 1600))
+    bot.clearControlStates()
+  }
+
   log.info('blind_survival_complete', { livenessState: liveness.getState() })
 }
 
@@ -2226,7 +2339,7 @@ async function handleMessage(username, message) {
       return
     }
 
-    const groundedState = buildGroundedState(bot, state, memory, anger)
+    const groundedState = buildGroundedState(bot, state, memory, anger, envPerception)
 
     let result
     try {
@@ -2382,7 +2495,7 @@ function fallbackCommand(username, message) {
   else if (cmd === 'collect' || cmd === 'pick up')   { if (!runTask('collecting', taskCollectNearby)) safeChat("Busy.") }
   else if (cmd === 'build house')                    { if (!runTask('building', taskBuildHouseSmart)) safeChat("Busy.") }
   else if (cmd === 'inventory')                      { const it = bot.inventory.items(); safeChat(it.length ? it.map(i=>`${i.name}x${i.count}`).join(', ') : 'Empty.') }
-  else if (cmd === 'look around')                    { const gs = buildGroundedState(bot, state, memory, anger); safeChat(`I see: ${chatSummary(gs) || 'nothing'}`) }
+  else if (cmd === 'look around')                    { const gs = buildGroundedState(bot, state, memory, anger, envPerception); safeChat(`I see: ${chatSummary(gs) || 'nothing'}`) }
   else {
     const m = cmd.match(/^craft (.+)$/);    if (m) { if (!runTask('crafting', () => taskCraftItem(m[1]))) safeChat("Busy."); return }
     const p = cmd.match(/^place (.+)$/);    if (p) { if (!runTask('placing', () => taskPlaceBlock(p[1].trim()))) safeChat("Busy."); return }

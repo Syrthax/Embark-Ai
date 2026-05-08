@@ -13,7 +13,7 @@ const HOSTILE_MOB_NAMES = new Set([
   'ravager','shulker','zombified_piglin','enderman',
 ])
 
-function buildGroundedState(bot, state, memory, anger = new Map()) {
+function buildGroundedState(bot, state, memory, anger = new Map(), perception = null) {
   const pos = bot.entity.position
 
   // REAL inventory — only what bot.inventory.items() returns right now
@@ -54,6 +54,9 @@ function buildGroundedState(bot, state, memory, anger = new Map()) {
     .filter(e => e.type === 'object' && e.objectType === 'Item' && e.position.distanceTo(pos) < 20)
   const droppedCount = droppedItems.length
 
+  // Environmental perception — scan on demand; null if module not ready
+  const envScan = perception ? perception.scan() : null
+
   return {
     self: {
       hp:     bot.health,                // real Minecraft HP  (0–20)
@@ -70,6 +73,7 @@ function buildGroundedState(bot, state, memory, anger = new Map()) {
     droppedCount,       // item entities on ground count  — real
     anger: Array.from(anger.entries()).map(([name, rec]) => ({ name, level: rec.level })),
     knownLocations: memory.locations.slice(-5).map(l => ({ name: l.name, pos: l.pos })),
+    environment: envScan,          // real-time spatial perception (null if unavailable)
   }
 }
 

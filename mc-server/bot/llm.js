@@ -13,7 +13,7 @@ const API_KEY         = process.env.FEATHERLESS_API_KEY
 const USER_AGENT      = 'project-k/1.0 (https://github.com/Syrthax/project-k)'
 
 function buildPrompt(groundedState, intent, playerMessage, botName = 'Ember') {
-  const { self, inventory, nearbyBlocks, entities, hostileMobs, droppedCount, knownLocations, anger } = groundedState
+  const { self, inventory, nearbyBlocks, entities, hostileMobs, droppedCount, knownLocations, anger, environment } = groundedState
 
   const energyLabel   = self.energy < 25 ? 'CRITICAL' : self.energy < 60 ? 'hurt' : 'full'
   const hungerLabel   = self.hunger < 25 ? 'STARVING' : self.hunger < 60 ? 'hungry' : 'fed'
@@ -28,6 +28,20 @@ function buildPrompt(groundedState, intent, playerMessage, botName = 'Ember') {
   const planksInInv   = inventory.filter(i => i.includes('_planks')).reduce((s, i) => {
     const m = i.match(/x(\d+)/); return s + (m ? parseInt(m[1]) : 0)
   }, 0)
+
+  // Spatial/environmental context — compact symbolic summary
+  const envStr = environment
+    ? [
+        `standing_on:${environment.standingOn}`,
+        `hazards:${environment.hazardSummary}`,
+        `risk:${environment.locomotionRisk}/10${environment.isEnclosed ? ' ENCLOSED' : ''}${environment.cliffNearby ? ` cliff-${environment.cliffDirection}` : ''}`,
+        `N:${environment.traversability?.N||'?'} S:${environment.traversability?.S||'?'} E:${environment.traversability?.E||'?'} W:${environment.traversability?.W||'?'}`,
+        `escape:${environment.escapeVector?.label||'?'}`,
+      ].join(' | ')
+    : 'unavailable'
+  const envDanger  = environment?.locomotionRisk >= 7
+  const inLava     = environment?.feetBlock === 'lava' || environment?.headBlock === 'lava'
+  const isEnclosed = environment?.isEnclosed ?? false
 
   return `You are ${botName}, a Minecraft survival bot with a genuine personality.
 Personality: independent, witty, occasionally sarcastic, but fundamentally cooperative.
@@ -47,6 +61,10 @@ hostile mobs: ${mobStr}
 items on ground: ${droppedCount > 0 ? droppedCount + ' item(s)' : 'none'}
 known locations: ${locsStr}
 players who angered you: ${angerStr}
+
+=== SPATIAL AWARENESS ===
+${envStr}${inLava ? '\nWARNING: standing in LAVA — escape immediately' : ''}${envDanger && !inLava ? '\nWARNING: high environmental risk — prioritize survival' : ''}${isEnclosed ? '\nWARNING: enclosed space detected — escape before other tasks' : ''}
+NOTE: Use this spatial data to make safe movement decisions. Never walk into hazards.
 
 === PLAYER MESSAGE ===
 "${playerMessage}"
@@ -73,7 +91,7 @@ intent: ${intent}
 - "mine_block"        → mine a specific block type. Add "target":"block_name" (e.g. "stone", "iron_ore", "coal_ore"). Auto-equips best tool.
 - "eat_food"          → eat from inventory if any food is present.
 - "flee"              → run away from hostile mobs. Use when low HP.
-- "escape"            → climb out of a hole / get unstuck. Pillars up or digs to surface.
+- "escape"            → climb out of a hole / get unstuck. Pillars up or digs to surface. USE when enclosed or risk≥7.
 - "build_house_smart" → build a house. Auto-gathers wood and crafts planks if needed.
 - "none"              → talking, questions, refusal.
 
