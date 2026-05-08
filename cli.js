@@ -272,6 +272,44 @@ function stopServer() {
 }
 
 // ── Bot management ───────────────────────────────────────────────────────────
+
+// Programmatic spawn — used by auto-respawn after fatal desync quit.
+function spawnBotDirect(name, model) {
+  if (state.bots.has(name)) return  // already running
+  const logPath = path.join(LOG_DIR, `bot_${name}.log`)
+  const logFd   = fs.openSync(logPath, 'a')  // append so we keep the old log
+
+  const proc = spawn('node', ['bot.js'], {
+    cwd: BOT_DIR,
+    env: { ...process.env, BOT_NAME: name, FEATHERLESS_MODEL: model },
+    stdio: ['ignore', logFd, logFd],
+  })
+
+  proc.on('error', (err) => {
+    console.log(tag(c.red, `Auto-respawn of "${name}" failed: ${err.message}`))
+    state.bots.delete(name)
+  })
+
+  proc.on('exit', (code) => {
+    const b = state.bots.get(name)
+    const uptime = b ? Date.now() - b.startedAt : 0
+    state.bots.delete(name)
+    if (b && code !== 0 && code !== null) {
+      console.log(tag(c.red, `Bot "${name}" crashed on respawn (code ${code}). Manual restart required.`))
+      tailLog(logPath)
+    } else if (b && code === 0 && uptime > 60000) {
+      console.log(tag(c.yellow, `Bot "${name}" disconnected again — auto-respawning...`))
+      spawnBotDirect(name, model)
+    } else {
+      console.log(tag(c.gray, `Bot "${name}" stopped`))
+    }
+  })
+
+  state.bots.set(name, { proc, model, logPath, startedAt: Date.now() })
+  const port = getServerPort()
+  console.log(tag(c.green, `Bot "${name}" respawned — joining localhost:${port} with ${model}`))
+}
+
 async function spawnBot() {
   const name = (await prompt(`${c.bold}Bot name${c.reset} (default Ember): `)).trim() || 'Ember'
 
@@ -311,13 +349,20 @@ async function spawnBot() {
 
   proc.on('exit', (code) => {
     const b = state.bots.get(name)
+    const uptime = b ? Date.now() - b.startedAt : 0
+    state.bots.delete(name)
+
     if (b && code !== 0 && code !== null) {
       console.log(tag(c.red, `Bot "${name}" crashed (code ${code}). Last log output:`))
       tailLog(logPath)
+    } else if (b && code === 0 && uptime > 60000) {
+      // Clean exit after >60s uptime — likely a fatal desync quit from fatalDesyncRecovery.js.
+      // Auto-respawn so the bot recovers without manual intervention.
+      console.log(tag(c.yellow, `Bot "${name}" disconnected (fatal desync) — auto-respawning...`))
+      spawnBotDirect(name, b.model)
     } else {
       console.log(tag(c.gray, `Bot "${name}" stopped`))
     }
-    state.bots.delete(name)
   })
 
   state.bots.set(name, { proc, model, logPath, startedAt: Date.now() })

@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '<system-reminder>project-k workflow: if this prompt asks for code changes in mc-server/bot/, invoke the runtime-planner subagent first to draft a plan against approach.md before implementing.</system-reminder>'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '<system-reminder>project-k workflow: if you made code changes in mc-server/bot/ this turn, invoke the code-quality subagent to scan the diff for duplicates, dead code, missing safe* wrappers, and module-discipline violations.</system-reminder>'"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '<system-reminder>project-k workflow: invoke the future-roadmap subagent to confirm current phase in approach.md and report what comes next.</system-reminder>'"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -10,6 +10,13 @@ const { buildGroundedState, chatSummary, HOSTILE_MOB_NAMES } = require('./state'
 const { classifyIntent, evaluateSurvival, validateLLMOutput, safeDefault, selectAutonomousGoal, detectInsult } = require('./engine')
 const { queryLLM, checkOllama, getModelName } = require('./llm')
 const log = require('./logger')
+const { safeDig, safeCraft, safeEquip, safeConsume, safePlaceBlock } = require('./safeMineflayer')
+const createEntityLivenessMonitor    = require('./entityLiveness')
+const createHealthIntegrityWatchdog  = require('./healthIntegrityWatchdog')
+const createFatalDesyncRecovery      = require('./fatalDesyncRecovery')
+const createMovementController       = require('./movementController')
+const createGoalRegistry             = require('./goalRegistry')
+const createRecoveryEngine           = require('./recoveryEngine')
 
 // ── Configuration via env ─────────────────────────────────────────────────────
 const BOT_NAME    = process.env.BOT_NAME    || 'Ember'
@@ -26,6 +33,9 @@ const bot = mineflayer.createBot({
 
 bot.loadPlugin(pathfinder)
 bot.loadPlugin(pvp)
+
+const liveness  = createEntityLivenessMonitor(bot, log)
+const movement  = createMovementController(bot, goals, makeMovements, log)
 
 // ── Internal State ─────────────────────────────────────────────────────────────
 const state = {
@@ -68,6 +78,12 @@ let taskBusy      = false
 //
 let currentTaskToken   = null
 let currentTaskContext = null   // { token, goalName, startedAt, silent, watchdog }
+
+const { setGoal } = createGoalRegistry(
+  state,
+  () => ({ taskBusy, currentTaskToken }),
+  log
+)
 
 const isOwner = (token) => currentTaskToken === token
 
@@ -158,6 +174,17 @@ bot.once('spawn', async () => {
   rememberLocation(memory, 'spawn', bot.entity.position)
   rememberEvent(memory, 'spawned', { model: getModelName() })
 
+  recoveryEngine = createRecoveryEngine({
+    bot, movement, state, log,
+    getTaskContext: () => ({ taskBusy, currentTaskToken }),
+    cancelTask:     cancelCurrentTask,
+    replaceTask,
+    runTask,
+    taskBlindSurvival,
+    taskEscape,
+    taskExplore,
+  })
+
   startStateLoop()
   startAgentLoop()
   startThreatLoop()
@@ -165,6 +192,8 @@ bot.once('spawn', async () => {
   startActivityWatchdog()
   startReconciliationWatchdog()
   startFreezeForensics()
+  startHealthBeacon()
+  createFatalDesyncRecovery(bot, liveness, log)
 })
 
 // ── Reconciliation Watchdog ──────────────────────────────────────────────────
@@ -175,6 +204,7 @@ bot.once('spawn', async () => {
 //   - state has a followTarget but goal is idle (handled by agent loop's auto-resume too)
 //   - taskBusy stuck true with no watchdog
 let recoveryAttempts = 0
+let recoveryEngine   = null  // initialized in spawn handler after task functions are available
 
 function startReconciliationWatchdog() {
   setInterval(() => {
@@ -182,17 +212,14 @@ function startReconciliationWatchdog() {
 
     // Check 1: following goal but no active path
     if (state.goal === 'following' && state.followTarget) {
-      const pathActive = bot.pathfinder?.isMoving() || bot.pathfinder?.goal != null
-      if (!pathActive) {
+      if (!movement.isActive()) {
         findings.push('following_no_path')
         const target = getPlayer(state.followTarget)
         if (target) {
-          try {
-            bot.pathfinder.setMovements(makeMovements())
-            bot.pathfinder.setGoal(new goals.GoalFollow(target.entity, 2), true)
+          if (!movement.follow(target.entity, 2, movement.PRIORITY.LOW, 'reconcile')) {
+            log.error('reconcile_follow_blocked', { blockedBy: movement.getOwner()?.source })
+          } else {
             recoveryAttempts++
-          } catch (e) {
-            log.error('reconcile_follow_setgoal_error', { message: e.message })
           }
         }
       }
@@ -203,7 +230,7 @@ function startReconciliationWatchdog() {
     if (taskBusy && !currentTaskContext) {
       findings.push('orphaned_taskBusy')
       taskBusy = false
-      state.goal = state.followTarget ? 'following' : 'idle'
+      setGoal(state.followTarget ? 'following' : 'idle', { source: 'reconciliation', reason: 'orphan_reset' })
       recoveryAttempts++
     }
 
@@ -230,6 +257,18 @@ const FREEZE_SNAPSHOT_TASK_AGE_MS    = 30000  // task running >30s with no compl
 const FREEZE_SNAPSHOT_POS_INVALID_MS = 3000   // position invalid >3s
 const FORCE_RECOVERY_POS_INVALID_MS  = 8000   // beyond this, force cancelCurrentTask
 
+// Freeze taxonomy — classify what kind of failure a freeze snapshot represents.
+// Returns a string tag used to route postmortem analysis.
+function classifyFreeze(s) {
+  if (s.livenessState === 'LIVE_FATAL' || s.livenessState === 'LIVE_RECOVERING') return 'entity_desync'
+  if (s.taskBusy && !s.currentTaskGoal) return 'runtime_corruption'
+  if (s.activeGotoCount > 0 && s.oldestGotoAgeMs > 15000 && !s.isMoving) return 'movement_deadlock'
+  if (s.activeGotoCount > 0 && s.oldestGotoAgeMs > 15000) return 'async_timeout'
+  if (s.posInvalidMs > 3000) return 'validator_dead_end'
+  if (s.taskBusy && s.taskAgeMs > FREEZE_SNAPSHOT_TASK_AGE_MS) return 'planner_stall'
+  return 'unknown'
+}
+
 let lastFreezeSnapshotAt    = 0
 const FREEZE_SNAPSHOT_INTERVAL_MS = 5000  // don't spam
 
@@ -241,7 +280,7 @@ function buildFreezeSnapshot(reason) {
     ? Math.min(...[...activeGotos.values()].map(g => g.startedAt))
     : null
 
-  return {
+  const snapshot = {
     reason,
     // Task state
     currentTaskGoal:  ctx?.goalName || null,
@@ -268,8 +307,9 @@ function buildFreezeSnapshot(reason) {
     // Position liveness
     livePosValid:     isValidVec(livePos),
     livePosRaw:       livePos ? { x: livePos.x, y: livePos.y, z: livePos.z } : null,
-    cachedPos:        lastValidPosition,
-    posInvalidMs:     lastValidPositionAt ? now - lastValidPositionAt : null,
+    cachedPos:        liveness.getCachedPos(),
+    posInvalidMs:     liveness.getInvalidMs() || null,
+    livenessState:    liveness.getState(),
 
     // Physics liveness
     onGround:         !!bot.entity?.onGround,
@@ -283,7 +323,16 @@ function buildFreezeSnapshot(reason) {
     dimension:        bot.game?.dimension || null,
     hp:               bot.health,
     food:             bot.food,
+
+    // Recovery state
+    recoveryState:    recoveryEngine?.getState() || null,
+    movementOwner:    movement.getOwner(),
+
+    // Tracing
+    cid: ctx?.correlationId || null,
   }
+  snapshot.freezeClass = classifyFreeze(snapshot)
+  return snapshot
 }
 
 function startFreezeForensics() {
@@ -294,9 +343,8 @@ function startFreezeForensics() {
     // Condition 1: task running too long
     const taskTooOld = ctx && (now - ctx.startedAt) > FREEZE_SNAPSHOT_TASK_AGE_MS
 
-    // Condition 2: position invalid too long
-    const livePos = bot.entity?.position
-    const posInvalidMs = isValidVec(livePos) ? 0 : (lastValidPositionAt ? now - lastValidPositionAt : Infinity)
+    // Condition 2: position invalid too long — use liveness monitor as source of truth
+    const posInvalidMs = liveness.getInvalidMs()
     const posInvalidLong = posInvalidMs > FREEZE_SNAPSHOT_POS_INVALID_MS
 
     // Snapshot (rate-limited)
@@ -314,9 +362,15 @@ function startFreezeForensics() {
     if (posInvalidMs > FORCE_RECOVERY_POS_INVALID_MS && taskBusy) {
       log.error('position_invalid_extended_force_cancel', {
         posInvalidMs,
+        livenessState: liveness.getState(),
         currentTaskGoal: ctx?.goalName,
       })
-      cancelCurrentTask()
+      recoveryEngine.recover('POSITION', {
+        source: 'freeze_forensics',
+        posInvalidMs,
+        goalName: ctx?.goalName,
+        cid: ctx?.correlationId,
+      })
     }
   }, 1000)
 }
@@ -428,6 +482,7 @@ const damageWindow = []       // recent raw damage event captures
 const hazardZones  = []       // { x, y, z, type, ts } — places we took env damage
 let damageState     = 'safe'  // safe | hurt | reacting
 let lastReactionAt  = 0
+let damageCorrelationCounter = 0
 
 // === Helpers for context capture ===
 
@@ -452,40 +507,32 @@ function getNearestHostileMobWithin(maxDist) {
   )
 }
 
-// Last position known to be valid — used as fallback for damage capture when
-// bot.entity.position is briefly invalid (e.g. after teleport / chunk reload).
-// Updated by the agent loop on every tick where position is valid.
-let lastValidPosition = null
-let lastValidPositionAt = 0
-const STALE_POSITION_MAX_MS = 5000  // beyond this, fallback is too stale to trust
-
 function captureDamageEvent() {
   const rawPos = bot.entity?.position
   let usingCached = false
   let pos = rawPos
 
   if (!isValidVec(rawPos)) {
-    // Fallback: use last known valid position if it's recent enough.
-    // This stops damage events from being silently dropped during the brief
-    // windows where bot.entity.position is NaN (post-teleport, chunk reload).
-    const cachedAge = lastValidPositionAt ? Date.now() - lastValidPositionAt : Infinity
-    if (lastValidPosition && cachedAge < STALE_POSITION_MAX_MS) {
-      pos = lastValidPosition
-      usingCached = true
-    } else {
+    // Degraded mode (diagnosis §13E): instead of silently dropping the event,
+    // use liveness.getBestPosition() which returns the best available position
+    // with a quality tag. Callers that see posSource='unknown_blind' route to
+    // reactToBlind() instead of the normal reaction pipeline.
+    const best = liveness.getBestPosition()
+    if (!best) {
       log.warn('damage_capture_skipped', {
-        reason: 'invalid_position_no_fresh_cache',
-        hasEntity: !!bot.entity,
-        hasPosition: !!rawPos,
-        rawX: rawPos?.x,
-        rawY: rawPos?.y,
-        rawZ: rawPos?.z,
-        typeofX: typeof rawPos?.x,
-        typeofY: typeof rawPos?.y,
-        typeofZ: typeof rawPos?.z,
-        cachedAgeMs: cachedAge === Infinity ? null : cachedAge,
+        reason: 'no_position_available',
+        livenessState: liveness.getState(),
+        invalidMs: liveness.getInvalidMs(),
       })
       return null
+    }
+    pos = best.pos
+    usingCached = best.source !== 'live'
+    if (best.source === 'unknown') {
+      // Mark as blind — classifier will fall through to reactToBlind()
+      usingCached = true
+      pos = best.pos || { x: 0, y: 0, z: 0 }
+      log.debug('damage_capture_blind', { livenessState: liveness.getState(), cacheAgeMs: liveness.getCachedAge() })
     }
   }
 
@@ -506,7 +553,7 @@ function captureDamageEvent() {
     inWater: !!bot.entity?.isInWater,
     inLava: !!bot.entity?.isInLava,
   }
-  if (usingCached) log.debug('damage_capture_using_cached_pos', { cachedAgeMs: Date.now() - lastValidPositionAt })
+  if (usingCached) log.debug('damage_capture_using_cached_pos', { cachedAgeMs: liveness.getCachedAge(), livenessState: liveness.getState() })
   return event
 }
 
@@ -559,11 +606,13 @@ function processDamageWindow() {
 
   // Classify and react
   const incident = classifyIncident(damageWindow)
+  const incidentCid = ++damageCorrelationCounter
   log.info('damage_incident', {
     type: incident.type,
     hits: damageWindow.length,
     hp: bot.health,
     detail: incident.summary,
+    cid: incidentCid,
   })
   lastReactionAt = Date.now()
   damageState = 'reacting'
@@ -677,7 +726,7 @@ bot.on('health', () => {
   if (bot.health <= 4 && taskBusy) {
     safeChat('Critical health — retreating!')
     cancelCurrentTask()  // atomically supersede ownership + stop movement
-    state.goal = 'resting'
+    setGoal('resting', { source: 'health_event', reason: 'critical_hp' })
   }
 })
 
@@ -733,10 +782,10 @@ function cancelCurrentTask() {
   currentTaskContext = null
   taskBusy = false
   if (oldCtx?.watchdog) clearTimeout(oldCtx.watchdog)
-  if (oldCtx && state.goal === oldCtx.goalName) state.goal = 'idle'
+  if (oldCtx && state.goal === oldCtx.goalName) setGoal('idle', { source: 'cancel_task', token: oldCtx.token })
   // Now stop movement. Old task's goto() Promise will reject on next microtask;
   // its catch handler will check ownership, see it lost, and no-op.
-  try { bot.pathfinder.stop() } catch {}
+  movement.forceStop('cancel')
   try { bot.pvp.stop() } catch {}
   bot.clearControlStates()
 }
@@ -766,22 +815,23 @@ function runTask(goalName, fn, { silent = false } = {}) {
     startedAt: Date.now(),
     silent,
     watchdog: null,
+    correlationId: ++correlationCounter,
   }
 
   taskBusy           = true
-  state.goal         = goalName
+  setGoal(goalName, { source: 'task_start', token: myToken })
   state.idleTicks    = 0
   state.lastActivityAt = Date.now()
   currentTaskToken   = myToken
   currentTaskContext = myCtx
 
-  log.info('task_start', { goal: goalName, silent })
+  log.info('task_start', { goal: goalName, silent, cid: myCtx.correlationId })
 
   myCtx.watchdog = setTimeout(() => {
     if (!isOwner(myToken)) return  // superseded; observational-only
-    log.warn('task_watchdog_kill', { goal: goalName, durationMs: Date.now() - myCtx.startedAt })
+    log.warn('task_watchdog_kill', { goal: goalName, durationMs: Date.now() - myCtx.startedAt, cid: myCtx.correlationId })
     if (!silent) safeChat('Timed out. Resetting.')
-    cancelCurrentTask()  // safe — we're still owner; this resets ownership
+    recoveryEngine.recover('TASK', { source: 'watchdog', goalName, cid: myCtx.correlationId })
   }, 90000)
 
   fn().then(() => {
@@ -789,18 +839,19 @@ function runTask(goalName, fn, { silent = false } = {}) {
       log.debug('task_complete_stale', { goal: goalName })
       return
     }
-    log.info('task_complete', { goal: goalName, durationMs: Date.now() - myCtx.startedAt })
+    log.info('task_complete', { goal: goalName, durationMs: Date.now() - myCtx.startedAt, cid: myCtx.correlationId })
     taskFailureCounts.set(goalName, 0)
+    recoveryEngine.reset('TASK')
   }).catch(err => {
     if (!isOwner(myToken)) {
       log.debug('task_error_stale', { goal: goalName, message: err.message })
       return  // we were replaced; the new task owns globals now
     }
-    log.error('task_error', { goal: goalName, message: err.message, durationMs: Date.now() - myCtx.startedAt })
+    log.error('task_error', { goal: goalName, message: err.message, durationMs: Date.now() - myCtx.startedAt, cid: myCtx.correlationId })
     if (!silent) safeChat(`Error in ${goalName}: ${err.message.slice(0, 80)}`)
 
     // Stop movement — we're still owner, this is our cleanup
-    try { bot.pathfinder.stop() } catch {}
+    movement.forceStop('task_error')
     try { bot.pvp.stop() } catch {}
     bot.clearControlStates()
 
@@ -812,12 +863,7 @@ function runTask(goalName, fn, { silent = false } = {}) {
       if (['exploring', 'mining', 'gathering'].includes(goalName) && n >= EXPLORE_FAIL_THRESHOLD) {
         log.warn('stuck_detected_scheduling_escape', { goal: goalName, consecutive: n })
         taskFailureCounts.set(goalName, 0)
-        setTimeout(() => {
-          // Schedule check is naturally token-safe: runTask gates on taskBusy
-          if (!taskBusy && state.goal === 'idle') {
-            runTask('escaping', taskEscape)
-          }
-        }, 200)
+        recoveryEngine.recover('MOVEMENT', { source: 'timeout_streak', goalName, consecutive: n, cid: myCtx.correlationId })
       }
     } else {
       taskFailureCounts.set(goalName, 0)
@@ -834,7 +880,7 @@ function runTask(goalName, fn, { silent = false } = {}) {
     taskBusy             = false
     state.lastActivityAt = Date.now()
     bot.clearControlStates()
-    if (state.goal === goalName) state.goal = 'idle'
+    if (state.goal === goalName) setGoal('idle', { source: 'task_complete', token: myToken })
   })
 
   return true
@@ -909,36 +955,28 @@ function makeMovements() {
 // start / resolve / reject / stale-resolve. Useful for forensic analysis
 // of pathfinder hangs and stuck-after-cancellation behaviours.
 let nextGotoId = 0
+let correlationCounter = 0  // monotonic; shared across tasks, goto, recovery, damage
 const activeGotos = new Map()  // id -> { id, startedAt, token, taskGoal, target }
 
-async function navNear(x, y, z, range = 3) {
+async function navNear(x, y, z, range = 3, priority = movement.PRIORITY.NORMAL) {
   if (isNaN(x) || isNaN(y) || isNaN(z)) throw new Error(`invalid position (${x},${y},${z}) — bot not ready`)
 
   const gotoId = ++nextGotoId
   const startedAt = Date.now()
   const ownerToken = currentTaskToken
   const ownerGoal = currentTaskContext?.goalName || null
+  const cid = currentTaskContext?.correlationId || null
   const target = { x, y, z, range }
   activeGotos.set(gotoId, { id: gotoId, startedAt, token: ownerToken, taskGoal: ownerGoal, target })
-  log.debug('goto_start', { id: gotoId, taskGoal: ownerGoal, target })
-
-  const mvmt = makeMovements()
-  bot.pathfinder.setMovements(mvmt)
-  let timer
-  const pathPromise = bot.pathfinder.goto(new goals.GoalNear(x, y, z, range))
-  const timeoutPromise = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      try { bot.pathfinder.stop() } catch {}
-      reject(new Error(`pathfinding timeout to (${x},${y},${z})`))
-    }, 15000)
-  })
+  log.debug('goto_start', { id: gotoId, taskGoal: ownerGoal, target, ...(cid != null && { cid }) })
 
   try {
-    await Promise.race([pathPromise, timeoutPromise])
+    await movement.navigate(x, y, z, range, priority, `goto_${gotoId}`)
     log.debug('goto_resolve', {
       id: gotoId,
       durationMs: Date.now() - startedAt,
       stale: ownerToken !== currentTaskToken,
+      ...(cid != null && { cid }),
     })
   } catch (e) {
     log.debug('goto_reject', {
@@ -946,10 +984,10 @@ async function navNear(x, y, z, range = 3) {
       durationMs: Date.now() - startedAt,
       stale: ownerToken !== currentTaskToken,
       message: e.message,
+      ...(cid != null && { cid }),
     })
     throw e
   } finally {
-    clearTimeout(timer)
     activeGotos.delete(gotoId)
   }
 }
@@ -962,7 +1000,7 @@ async function equipBestWeapon() {
   for (const w of weapons) {
     const id = bot.registry.itemsByName[w]?.id
     const item = id ? bot.inventory.findInventoryItem(id, null, false) : null
-    if (item) { await bot.equip(item, 'hand'); return w }
+    if (item) { await safeEquip(bot, item, 'hand'); return w }
   }
   return null
 }
@@ -986,13 +1024,12 @@ async function taskExplore() {
   log.debug('explore_target', { from: safeFloor(p), to: { x: tx, y: ty, z: tz } })
 
   // Fail fast on complex terrain — try another direction next idle cycle
-  const prev = bot.pathfinder.thinkingTimeout
-  bot.pathfinder.thinkingTimeout = 2000
+  movement.setThinkingTimeout(2000)
   try {
     await navNear(tx, ty, tz, 5)
     rememberLocation(memory, 'last_explored', bot.entity.position)
   } finally {
-    bot.pathfinder.thinkingTimeout = prev
+    movement.restoreThinkingTimeout()
   }
 }
 
@@ -1004,7 +1041,7 @@ async function taskGatherWood() {
   await navNear(log.position.x, log.position.y, log.position.z, 2)
   const fresh = bot.blockAt(log.position)
   if (fresh && ids.includes(fresh.type) && bot.canDigBlock(fresh)) {
-    await bot.dig(fresh)
+    await safeDig(bot, fresh)
     safeChat('Got wood.')
     rememberEvent(memory, 'gathered_wood', {})
   }
@@ -1025,7 +1062,7 @@ async function taskCraftPlanks() {
 
     try {
       const count = log.count
-      await bot.craft(recipes[0], count, null)
+      await safeCraft(bot, recipes[0], count, null)
       totalCrafted += count * 4
     } catch (err) {
       console.error(`[${BOT_NAME}] Plank craft failed:`, err.message)
@@ -1158,7 +1195,7 @@ async function ensureSticks() {
     return false
   }
   try {
-    await bot.craft(recipes[0], 1, null)
+    await safeCraft(bot, recipes[0], 1, null)
     log.info('crafted_sticks_auto', { sticksNow: countItemsByName('stick') })
     return true
   } catch (e) {
@@ -1203,7 +1240,7 @@ async function taskCraftItem(itemName) {
     try {
       const stickBefore = countItemsByName('stick')
       const planksBefore = countMaterialFamily('_planks')
-      await bot.craft(recipes[0], 1, null)
+      await safeCraft(bot, recipes[0], 1, null)
       const after = countItemsByName(normalized)
       const stickAfter = countItemsByName('stick')
       const planksAfter = countMaterialFamily('_planks')
@@ -1274,7 +1311,7 @@ async function taskCraftItem(itemName) {
   try {
     const stickBefore = countItemsByName('stick')
     const planksBefore = countMaterialFamily('_planks')
-    await bot.craft(recipes[0], 1, table)
+    await safeCraft(bot, recipes[0], 1, table)
     const after = countItemsByName(normalized)
     const stickAfter = countItemsByName('stick')
     const planksAfter = countMaterialFamily('_planks')
@@ -1309,7 +1346,7 @@ async function placeFromInventory(blockName) {
   const item = bot.inventory.findInventoryItem(itemId, null, false)
   if (!item) return false
 
-  await bot.equip(item, 'hand')
+  await safeEquip(bot, item, 'hand')
 
   // Compute "in front of bot" target — uses yaw to find facing direction
   const yaw = bot.entity.yaw
@@ -1336,7 +1373,7 @@ async function placeFromInventory(blockName) {
       if (!refBlock || refBlock.boundingBox !== 'block') continue
       try {
         const faceVec = targetPos.minus(refBlock.position)
-        await bot.placeBlock(refBlock, faceVec)
+        await safePlaceBlock(bot, refBlock, faceVec)
         log.info('placed_block', { block: normalized, pos: { x: targetPos.x, y: targetPos.y, z: targetPos.z } })
         return true
       } catch (e) {
@@ -1412,7 +1449,7 @@ async function taskMineBlock(blockName, count = 1) {
       }
       // Equip the best tool we have
       await equipBestTool(target)
-      await bot.dig(fresh)
+      await safeDig(bot, fresh)
       mined++
       consecutiveFailures = 0
       log.info('mined', { block: target, count: mined })
@@ -1450,7 +1487,7 @@ async function equipBestTool(blockName) {
     const id = bot.registry.itemsByName[tool]?.id
     const item = id ? bot.inventory.findInventoryItem(id, null, false) : null
     if (item) {
-      try { await bot.equip(item, 'hand'); return tool } catch {}
+      try { await safeEquip(bot, item, 'hand'); return tool } catch {}
     }
   }
   return null
@@ -1484,8 +1521,8 @@ async function taskEatFood() {
 
   log.info('eat_start', { food: food.name, hungerBefore: bot.food })
   try {
-    await bot.equip(food, 'hand')
-    await bot.consume()
+    await safeEquip(bot, food, 'hand')
+    await safeConsume(bot)
     log.info('eat_success', { food: food.name, hungerBefore: bot.food, hungerAfter: bot.food })
     safeChat(`Ate ${food.name.replace(/_/g, ' ')}.`)
     rememberEvent(memory, 'ate', { food: food.name })
@@ -1518,8 +1555,7 @@ async function taskEscape() {
     { x: cx,     z: cz - 6, y: targetY },
   ]
 
-  const prevTimeout = bot.pathfinder.thinkingTimeout
-  bot.pathfinder.thinkingTimeout = 5000  // give pathfinder more time to plan dig/place
+  movement.setThinkingTimeout(5000)  // give pathfinder more time to plan dig/place
   try {
     for (const a of attempts) {
       try {
@@ -1533,7 +1569,7 @@ async function taskEscape() {
       }
     }
   } finally {
-    bot.pathfinder.thinkingTimeout = prevTimeout
+    movement.restoreThinkingTimeout()
   }
 
   // Last resort: dig straight up
@@ -1558,7 +1594,7 @@ async function digUp(maxBlocks = 10) {
     }
     try {
       await equipBestTool(headBlock.name)
-      await bot.dig(headBlock)
+      await safeDig(bot, headBlock)
       dug++
       // Jump up to occupy the new block space
       bot.setControlState('jump', true)
@@ -1620,10 +1656,10 @@ async function taskEvadeHazard(hazard) {
   })
   safeChat(`Ow — ${label}!`)
 
-  try { bot.pathfinder.stop() } catch {}
+  movement.forceStop('evade_start')
   bot.clearControlStates()
   await new Promise(r => setTimeout(r, 100))
-  await navNear(tx, ty, tz, 2)
+  await navNear(tx, ty, tz, 2, movement.PRIORITY.HIGH)
   log.info('evade_complete', { newPos: safeFloor(bot.entity?.position) })
 }
 
@@ -1699,7 +1735,7 @@ async function taskBuildHouseSmart() {
         await navNear(log.position.x, log.position.y, log.position.z, 2)
         const fresh = bot.blockAt(log.position)
         if (fresh && ids.includes(fresh.type)) {
-          await bot.dig(fresh)
+          await safeDig(bot, fresh)
           chopped++
         } else { break }
       } catch (e) {
@@ -1729,7 +1765,7 @@ async function placeBlockAt(targetPos, blockName) {
   const item   = itemId ? bot.inventory.findInventoryItem(itemId, null, false) : null
   if (!item) return false
 
-  await bot.equip(item, 'hand')
+  await safeEquip(bot, item, 'hand')
 
   const adj = [[0,-1,0],[0,1,0],[1,0,0],[-1,0,0],[0,0,1],[0,0,-1]]
   for (const [dx, dy, dz] of adj) {
@@ -1738,7 +1774,7 @@ async function placeBlockAt(targetPos, blockName) {
     try {
       await navNear(targetPos.x, targetPos.y, targetPos.z, 4)
       const faceVec = targetPos.minus(refBlock.position)
-      await bot.placeBlock(refBlock, faceVec)
+      await safePlaceBlock(bot, refBlock, faceVec)
       return true
     } catch {}
   }
@@ -1825,6 +1861,33 @@ function tryAutonomous() {
 // state so autonomous behavior can resume. Different from the per-task watchdog:
 // this catches "everything completed normally but bot is now stuck doing nothing".
 
+// ── Health Beacon (10s) ───────────────────────────────────────────────────────
+// Continuous runtime health timeline for postmortem reconstruction.
+// Promotes the edge-only freeze_snapshot into an always-on pulse.
+
+function startHealthBeacon() {
+  setInterval(() => {
+    const ctx = currentTaskContext
+    const now = Date.now()
+    log.info('runtime_health_snapshot', {
+      livenessState:      liveness.getState(),
+      livenessInvalidMs:  liveness.getInvalidMs() || 0,
+      movementOwner:      movement.getOwner(),
+      taskGoal:           ctx?.goalName || null,
+      taskAgeMs:          ctx ? now - ctx.startedAt : null,
+      taskBusy,
+      watchdogActive:     !!ctx?.watchdog,
+      recoveryLevels:     recoveryEngine ? Object.fromEntries(
+        Object.entries(recoveryEngine.getState()).map(([k, v]) => [k, v.level])
+      ) : null,
+      hp:   bot.health,
+      food: bot.food,
+      goal: state.goal,
+      cid:  ctx?.correlationId || null,
+    })
+  }, 10_000)
+}
+
 const ACTIVITY_TIMEOUT_MS = 5 * 60 * 1000  // 5 minutes
 const ACTIVITY_CHECK_INTERVAL_MS = 30 * 1000
 
@@ -1838,10 +1901,28 @@ function startActivityWatchdog() {
       return
     }
     log.warn('activity_watchdog_reset', { idleMs: elapsed, goal: state.goal })
-    // Force a fresh autonomous decision next tick
-    state.idleTicks = 999
+    recoveryEngine.recover('IDLE', { source: 'activity_watchdog', idleMs: elapsed })
     state.lastActivityAt = Date.now()
   }, ACTIVITY_CHECK_INTERVAL_MS)
+}
+
+// Blind survival: sprint away in a random direction using raw control states.
+// Used when position is invalid (NaN) — does NOT use the pathfinder.
+// This breaks the "validator dead-end" failure where the bot stands still dying
+// because all damage events are dropped due to stale position cache (diagnosis F18).
+async function taskBlindSurvival() {
+  log.warn('blind_survival_start', { livenessState: liveness.getState() })
+  safeChat('Taking hits. Moving blind.')
+  const angle = Math.random() * Math.PI * 2
+  try { bot.entity.yaw = angle } catch {}
+  bot.setControlState('forward', true)
+  bot.setControlState('sprint', true)
+  bot.setControlState('jump', true)
+  await new Promise(r => setTimeout(r, 400))
+  bot.setControlState('jump', false)
+  await new Promise(r => setTimeout(r, 1600))
+  bot.clearControlStates()
+  log.info('blind_survival_complete', { livenessState: liveness.getState() })
 }
 
 // ── Threat Reaction Loop (auto-attack hostile mobs in range) ─────────────────
@@ -1865,7 +1946,16 @@ function startThreatLoop() {
 // ── State Loop (1s) ───────────────────────────────────────────────────────────
 
 function startStateLoop() {
+  const hpWatchdog = createHealthIntegrityWatchdog(
+    bot, log,
+    () => { replaceTask('blind_survival', taskBlindSurvival, { silent: true }) },
+    () => lastReactionAt
+  )
+
   setInterval(() => {
+    // HP-loss watchdog: detects silent damage when damage pipeline is blinded by NaN position
+    hpWatchdog.tick()
+
     // Sync from real Minecraft values — bot is a full player with actual HP and hunger
     state.energy = Math.round((bot.health / 20) * 100)  // 0-100 from 0-20 HP
     state.hunger = Math.round((bot.food   / 20) * 100)  // 0-100 from 0-20 food
@@ -1875,14 +1965,14 @@ function startStateLoop() {
     // Low HP while doing something — cancel task and rest (health regen when idle)
     if (state.energy <= 15 && active) {
       cancelCurrentTask()  // atomically supersedes ownership + stops movement
-      state.goal = 'resting'
+      setGoal('resting', { source: 'state_loop', reason: 'low_hp' })
       safeChat('Low health. Pulling back.')
       rememberEvent(memory, 'low_health', { hp: bot.health })
     }
 
     // Recovered to 80% HP — resume normal operation (and follow if we were)
     if (state.goal === 'resting' && state.energy >= 80) {
-      state.goal = state.followTarget ? 'following' : 'idle'
+      setGoal(state.followTarget ? 'following' : 'idle', { source: 'state_loop', reason: 'rest_recovery' })
       safeChat('Health up. Ready.')
       log.info('rest_recovery', { resumedGoal: state.goal, followTarget: state.followTarget })
     }
@@ -1968,20 +2058,15 @@ function startAgentLoop() {
   let stuckTicks = 0
 
   setInterval(() => {
-    // Update the cached last-valid position for damage capture fallback.
-    // Runs every 250ms, so cache staleness is bounded.
-    const livePos = bot.entity?.position
-    if (isValidVec(livePos)) {
-      lastValidPosition   = { x: livePos.x, y: livePos.y, z: livePos.z }
-      lastValidPositionAt = Date.now()
-    }
+    // Advance entity liveness state machine — must run every 250ms tick.
+    liveness.tick()
 
     // Auto-resume follow if we have a follow target but no active task or goal.
     // This survives ALL interruptions — counter-attacks, auto-eat, resting, autonomous
     // tasks, etc. The user has to explicitly say "stop" to clear followTarget.
     if (state.followTarget && state.goal === 'idle' && !taskBusy) {
       log.info('follow_auto_resumed', { target: state.followTarget, prevGoal })
-      state.goal = 'following'
+      setGoal('following', { source: 'agent_loop', reason: 'follow_auto_resume' })
     }
 
     // Look at the player we're following, or the nearest one if just idling
@@ -2001,9 +2086,9 @@ function startAgentLoop() {
       if (!target) {
         lostTicks++
         if (lostTicks >= 20) {
-          try { bot.pathfinder.stop() } catch {}
+          movement.stop('follow')
           bot.clearControlStates()
-          state.goal = 'idle'
+          setGoal('idle', { source: 'agent_loop', reason: 'follow_lost' })
           state.followTarget = null
           safeChat('Lost you.')
           log.info('follow_lost', { target: prevFollowTarget })
@@ -2024,12 +2109,7 @@ function startAgentLoop() {
 
         if (shouldReissue) {
           followRefreshTicks = 0
-          try {
-            bot.pathfinder.setMovements(makeMovements())
-            bot.pathfinder.setGoal(new goals.GoalFollow(target.entity, 2), true)
-          } catch (e) {
-            log.error('follow_setgoal_error', { message: e.message })
-          }
+          movement.follow(target.entity, 2, movement.PRIORITY.LOW, 'follow')
         }
 
         // Stuck detection: tighten to ~4s of no movement.
@@ -2045,12 +2125,9 @@ function startAgentLoop() {
               stuckTicks++
               if (stuckTicks >= 4) {  // 4 × 1s = 4s of no movement
                 log.warn('follow_stuck_reset', { targetDist, moved, target: state.followTarget })
-                try { bot.pathfinder.stop() } catch {}
+                movement.forceStop('stuck')
                 bot.clearControlStates()
-                try {
-                  bot.pathfinder.setMovements(makeMovements())
-                  bot.pathfinder.setGoal(new goals.GoalFollow(target.entity, 2), true)
-                } catch {}
+                movement.follow(target.entity, 2, movement.PRIORITY.LOW, 'follow')
                 stuckTicks = 0
               }
             } else {
@@ -2068,7 +2145,7 @@ function startAgentLoop() {
     }
 
     if (prevGoal === 'following' && state.goal !== 'following') {
-      try { bot.pathfinder.stop() } catch {}
+      movement.stop('follow')
       bot.clearControlStates()
     }
 
@@ -2174,8 +2251,8 @@ function executeAction(result, username, groundedState) {
   switch (result.action) {
 
     case 'follow':
-      state.goal = 'following'
       state.followTarget = username  // track who specifically — survives other players joining
+      setGoal('following', { source: 'llm', reason: 'action=follow' })
       state.idleTicks = 0
       rememberKnowledge(memory, 'following_player', username)
       break
@@ -2268,7 +2345,7 @@ function executeAction(result, username, groundedState) {
 function fallbackCommand(username, message) {
   const cmd = message.trim().toLowerCase()
 
-  if (cmd === 'follow me')                           { if (state.energy < 25) { safeChat('Too tired.'); return }; state.goal = 'following'; state.followTarget = username; safeChat('Following.') }
+  if (cmd === 'follow me')                           { if (state.energy < 25) { safeChat('Too tired.'); return }; state.followTarget = username; setGoal('following', { source: 'fallback_cmd', reason: 'follow_me' }); safeChat('Following.') }
   else if (cmd === 'stop')                           { cancelCurrentTask(); state.followTarget = null; safeChat('Stopped.') }
   else if (cmd === 'status')                         { safeChat(`Goal: ${state.goal} | E:${state.energy.toFixed(0)} H:${state.hunger.toFixed(0)} | anger:${anger.size}`) }
   else if (cmd === 'explore')                        { if (!runTask('exploring', taskExplore)) safeChat("Busy.") }
