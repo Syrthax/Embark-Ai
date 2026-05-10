@@ -1,54 +1,41 @@
-// fatalDesyncRecovery.js — Force clean disconnect when entity desync is fatal.
+// fatalDesyncRecovery.js — Detect entity position desync; report it to the arbiter.
 //
-// If bot.entity.position remains NaN for > FATAL_QUIT_THRESHOLD_MS, the Mineflayer
-// client is in an unrecoverable state (velocity/position packet corruption — see
-// diagnosis §5 "Why position becomes NaN"). The correct response is to disconnect
-// and reconnect, not to wait passively until the bot dies.
+// When bot.entity.position has a NaN/null component (Mineflayer entity desync — a
+// velocity packet with a bad delta-time corrupts the position) for longer than
+// DESYNC_HARD_MS (~5s), the client is in an unrecoverable state: no local maneuver
+// (cancelTask, blind survival, escape) can fix it, because the bot genuinely isn't
+// where it thinks it is (diagnosis#2 §1.3). The only correct response is to reconnect.
 //
-// bot.quit() triggers bot.on('end') in bot.js → process.exit(0).
-// cli.js / tui.js detect the clean exit (code 0) and auto-respawn the bot.
+// This module DETECTS and REPORTS only. recoveryEngine is the single arbiter that
+// owns the reconnect — see diagnosis#2 §2.1: recovery used to be multi-headed and the
+// heads raced (this module's own bot.quit() fired ~4s before / after others' would
+// have). Now the flow is: detect desync → recovery.report('DESYNC') → arbiter quits.
+// botSupervisor.js still gets its short reconnect backoff because the arbiter writes
+// exit_reason.json {reason:"entity_desync"} before quitting.
 
-const FATAL_QUIT_THRESHOLD_MS = 30000  // 30s at LIVE_FATAL before quitting
-const CHECK_INTERVAL_MS       = 2000
+const CHECK_INTERVAL_MS = 1000
 
-module.exports = function createFatalDesyncRecovery(bot, liveness, log) {
-  let fatalSince  = null  // ms when state first became LIVE_FATAL
-  let quitPending = false
+module.exports = function createFatalDesyncRecovery(bot, liveness, log, onDesync) {
+  let reported = false
 
   const interval = setInterval(() => {
-    if (quitPending) return
+    if (reported) return
+    if (!liveness.isDesynced()) return
 
-    const state = liveness.getState()
-    const STATES = liveness.STATES
-
-    if (state !== STATES.LIVE_FATAL) {
-      fatalSince = null
-      return
-    }
-
-    const now = Date.now()
-    if (!fatalSince) { fatalSince = now; return }
-
-    const fatalMs = now - fatalSince
-    if (fatalMs < FATAL_QUIT_THRESHOLD_MS) return
-
-    // LIVE_FATAL has persisted long enough — this is client corruption, not a glitch.
-    quitPending = true
+    reported = true
     clearInterval(interval)
     log.fatal('fatal_desync_quit', {
-      fatalMs,
-      invalidMs: liveness.getInvalidMs(),
-      cachedPos: liveness.getCachedPos(),
+      invalidMs:     liveness.getInvalidMs(),
+      cachedPos:     liveness.getCachedPos(),
+      livenessState: liveness.getState(),
     })
     try {
-      bot.chat('Entity desync — reconnecting.')
-    } catch {}
-    setTimeout(() => {
-      try { bot.quit() } catch (e) {
-        log.error('fatal_desync_quit_error', { message: e.message })
-        process.exit(0)
-      }
-    }, 300)
+      onDesync({ source: 'fatal_desync', invalidMs: liveness.getInvalidMs() })
+    } catch (e) {
+      log.error('fatal_desync_report_error', { message: e.message })
+      // Last-resort fallback: if the arbiter is unreachable, quit anyway.
+      try { bot.quit() } catch { process.exit(0) }
+    }
   }, CHECK_INTERVAL_MS)
 
   return { interval }

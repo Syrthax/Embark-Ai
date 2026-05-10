@@ -9,8 +9,10 @@
 // If HP falls by more than HP_DROP_THRESHOLD in HP_WINDOW_MS without a recent
 // damage_incident being issued by the normal pipeline, it calls onSilentDamage().
 //
-// onSilentDamage() in bot.js calls replaceTask('blind_survival', taskBlindSurvival)
-// which sprints away using raw control states — no pathfinder, no position required.
+// onSilentDamage() in bot.js reports to recoveryEngine (the single arbiter) — which
+// routes to DESYNC (reconnect) if the position is structurally invalid, or CRITICAL_HP
+// (blind-survival sprint, raw control states) if it's valid. This watchdog detects and
+// reports; it never acts directly.
 
 const HP_DROP_THRESHOLD  = 2    // more than 2 HP lost in the window
 const HP_WINDOW_MS       = 2000 // rolling window size

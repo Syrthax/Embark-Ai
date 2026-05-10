@@ -19,7 +19,9 @@
 
 const TRANSIENT_MS       = 500
 const CACHE_MAX_MS       = 5000
-const FATAL_THRESHOLD_MS = 30000
+const FATAL_THRESHOLD_MS = 8000   // was 30000 — the desync owner reconnects at DESYNC_HARD_MS,
+                                  // so LIVE_FATAL should never be reached in a pure desync now.
+const DESYNC_HARD_MS     = 5000   // structurally-invalid position for this long ⇒ reconnect now
 
 const STATES = Object.freeze({
   LIVE_VALID:             'LIVE_VALID',
@@ -109,5 +111,11 @@ module.exports = function createEntityLivenessMonitor(bot, log) {
   function getCachedAge()  { return lastValidAt ? Date.now() - lastValidAt : Infinity }
   function getInvalidMs()  { return invalidSince ? Date.now() - invalidSince : 0 }
 
-  return { tick, getState, getBestPosition, getCachedPos, getCachedAge, getInvalidMs, STATES }
+  // True when the live position has been structurally invalid (NaN/null component,
+  // or entity absent) continuously for longer than DESYNC_HARD_MS. This is the single
+  // trigger for the fast reconnect path — a desync is binary, not graded: no local
+  // maneuver can fix it, so the only correct response is to quit and reconnect.
+  function isDesynced()    { return invalidSince != null && (Date.now() - invalidSince) > DESYNC_HARD_MS }
+
+  return { tick, getState, getBestPosition, getCachedPos, getCachedAge, getInvalidMs, isDesynced, STATES }
 }

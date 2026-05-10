@@ -212,9 +212,18 @@ module.exports = function createEnvironmentPerception(bot, log) {
   function scan(radius = SCAN_RADIUS_DEFAULT) {
     _pruneMemory()
 
-    if (!bot.entity?.position) return _empty()
+    if (!bot.entity?.position) return _invalid('no_entity')
 
     const pos = bot.entity.position
+    // NaN/null component = entity desync (LIVE_FATAL window). Math.floor(NaN) = NaN,
+    // making every blockAt probe return null — scan would report "all clear" and
+    // escapeVector would default North. Reject early so callers see valid:false,
+    // not a plausible-looking zero-risk result.
+    if (!Number.isFinite(pos.x) || !Number.isFinite(pos.y) || !Number.isFinite(pos.z)) {
+      log.warn('perception_position_invalid', { x: pos.x, y: pos.y, z: pos.z })
+      return _invalid('position_nan')
+    }
+
     const bx  = Math.floor(pos.x)
     const by  = Math.floor(pos.y)
     const bz  = Math.floor(pos.z)
@@ -291,6 +300,7 @@ module.exports = function createEnvironmentPerception(bot, log) {
     const hazardSummary  = _hazardSummary(hazards)
 
     const result = {
+      valid:               true,
       hazards:             hazards.slice(0, 8),
       hazardSummary,
       traversability,
@@ -345,13 +355,26 @@ module.exports = function createEnvironmentPerception(bot, log) {
     ].join(' | ')
   }
 
-  function _empty() {
+  // Returns an explicitly-invalid scan result. Callers must check valid===false before
+  // trusting any fields — in particular locomotionRisk and escapeVector are meaningless.
+  function _invalid(reason) {
     return {
-      hazards: [], hazardSummary: 'unknown', traversability: { N:'unknown',S:'unknown',E:'unknown',W:'unknown' },
-      escapeVector: { direction:'N', label:'north', dx:0, dz:-1, score:0 },
-      standingOn:'unknown', feetBlock:'unknown', headBlock:'unknown',
-      locomotionRisk:0, isEnclosed:false, cliffNearby:false, cliffDirection:null,
-      stuckClass:'unknown', nearbyBlocksCompact:[], hazardMemorySize:0,
+      valid:               false,
+      reason,
+      hazards:             [],
+      hazardSummary:       'position_invalid',
+      traversability:      { N:'unknown', S:'unknown', E:'unknown', W:'unknown' },
+      escapeVector:        { direction:'N', label:'north', dx:0, dz:-1, score:0 },
+      standingOn:          'unknown',
+      feetBlock:           'unknown',
+      headBlock:           'unknown',
+      locomotionRisk:      null,
+      isEnclosed:          false,
+      cliffNearby:         false,
+      cliffDirection:      null,
+      stuckClass:          'unknown',
+      nearbyBlocksCompact: [],
+      hazardMemorySize:    hazardMemory.length,
     }
   }
 

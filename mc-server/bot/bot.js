@@ -13,7 +13,7 @@ const { buildGroundedState, chatSummary, HOSTILE_MOB_NAMES } = require('./state'
 const { classifyIntent, evaluateSurvival, validateLLMOutput, safeDefault, selectAutonomousGoal, detectInsult } = require('./engine')
 const { queryLLM, checkOllama, getModelName } = require('./llm')
 const log = require('./logger')
-const { safeDig, safeCraft, safeEquip, safeConsume, safePlaceBlock } = require('./safeMineflayer')
+const { safeDig, safeCraft, safeEquip, safeConsume, safePlaceBlock, safeAttack } = require('./safeMineflayer')
 const createEntityLivenessMonitor    = require('./entityLiveness')
 const createHealthIntegrityWatchdog  = require('./healthIntegrityWatchdog')
 const createFatalDesyncRecovery      = require('./fatalDesyncRecovery')
@@ -192,6 +192,7 @@ bot.once('spawn', async () => {
     taskBlindSurvival,
     taskEscape,
     taskExplore,
+    writeExitReason,
   })
 
   envPerception      = createEnvironmentPerception(bot, log)
@@ -206,7 +207,7 @@ bot.once('spawn', async () => {
   startFreezeForensics()
   startHealthBeacon()
   startPerceptionLoop()
-  createFatalDesyncRecovery(bot, liveness, log)
+  createFatalDesyncRecovery(bot, liveness, log, (ctx) => recoveryEngine.report('DESYNC', ctx))
 
   // Post-spawn integrity check: confirm entity liveness reaches LIVE_VALID within 30s.
   // A failure here means position/entity data never arrived — likely a login-phase desync.
@@ -288,13 +289,13 @@ function startReconciliationWatchdog() {
 // Fires `freeze_snapshot` log entry with full runtime state when:
 //   - a task has been running > FREEZE_SNAPSHOT_TASK_AGE_MS, OR
 //   - position has been invalid for > FREEZE_SNAPSHOT_POS_INVALID_MS
-// Also forces a recovery cancel if position is invalid for too long
-// (escape hatch from validator dead-end).
+// Desync→reconnect is NOT handled here: fatalDesyncRecovery.js owns that decision
+// (it reconnects as soon as liveness.isDesynced() flips true). This loop is purely
+// observational.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const FREEZE_SNAPSHOT_TASK_AGE_MS    = 30000  // task running >30s with no completion
 const FREEZE_SNAPSHOT_POS_INVALID_MS = 3000   // position invalid >3s
-const FORCE_RECOVERY_POS_INVALID_MS  = 8000   // beyond this, force cancelCurrentTask
 
 // Freeze taxonomy — classify what kind of failure a freeze snapshot represents.
 // Returns a string tag used to route postmortem analysis.
@@ -400,23 +401,6 @@ function startFreezeForensics() {
       log.warn('freeze_snapshot', buildFreezeSnapshot(reason))
       lastFreezeSnapshotAt = now
     }
-
-    // Recovery escape hatch: if position has been invalid for too long, force a cancel.
-    // This breaks any silent loops where validators keep rejecting and damage events
-    // are silently dropped with no recovery path.
-    if (posInvalidMs > FORCE_RECOVERY_POS_INVALID_MS && taskBusy) {
-      log.error('position_invalid_extended_force_cancel', {
-        posInvalidMs,
-        livenessState: liveness.getState(),
-        currentTaskGoal: ctx?.goalName,
-      })
-      recoveryEngine.recover('POSITION', {
-        source: 'freeze_forensics',
-        posInvalidMs,
-        goalName: ctx?.goalName,
-        cid: ctx?.correlationId,
-      })
-    }
   }, 1000)
 }
 
@@ -519,6 +503,7 @@ const HAZARD_MEMORY_MS    = 60000  // hazard zones remembered for 1 min
 // Cooldowns for chat / arm-swing (separate from reaction cooldown)
 let lastHitChatAt      = 0
 let lastCounterPunchAt = 0
+let currentPlayerAttackTarget = null  // username of the player we're currently in goal=attacking against
 const HIT_CHAT_COOLDOWN_MS      = 4000
 const COUNTER_PUNCH_COOLDOWN_MS = 1500
 
@@ -528,6 +513,11 @@ const hazardZones  = []       // { x, y, z, type, ts } — places we took env da
 let damageState     = 'safe'  // safe | hurt | reacting
 let lastReactionAt  = 0
 let damageCorrelationCounter = 0
+// Single damage-reaction authority (Fix 4): health event sets this flag instead of
+// acting directly. processDamageWindow reads it to bypass the cooldown and react
+// with a real escape. Prevents the health handler racing processDamageWindow.
+let criticalHpFlag  = null    // { at: number, hp: number } | null
+let prevHp          = null    // tracks last seen HP for sharp-drop detection
 
 // === Helpers for context capture ===
 
@@ -645,9 +635,15 @@ function processDamageWindow() {
     damageState = 'hurt'
   }
 
-  // Reaction cooldown: don't act on every tick
+  // Reaction cooldown: don't act on every tick.
+  // Priority bypass: if the health handler flagged a critical HP event that is newer
+  // than our last reaction, skip the cooldown for this one incident only.
   const sinceReaction = Date.now() - lastReactionAt
-  if (sinceReaction < REACTION_COOLDOWN_MS) return
+  if (sinceReaction < REACTION_COOLDOWN_MS) {
+    if (!criticalHpFlag || criticalHpFlag.at <= lastReactionAt) return
+    log.warn('critical_hp_bypass', { hp: criticalHpFlag.hp, sinceReaction })
+    criticalHpFlag = null
+  }
 
   // Classify and react
   const incident = classifyIncident(damageWindow)
@@ -707,10 +703,34 @@ function reactToPlayerAttack(attacker) {
   const rec = bumpAnger(attacker.name, ANGER_HIT, 'attacked me')
   const now = Date.now()
   if (rec.level >= ANGER_ATTACK_LEVEL) {
+    // Symmetric guard matching reactToMobAttack: don't restart the attack task on every hit.
+    if (taskBusy && state.goal === 'attacking') {
+      if (currentPlayerAttackTarget === attacker.name) return  // already engaged with this player
+
+      // Different player is hitting us mid-attack. Switch only if the new attacker is
+      // closer than our current target (they're the more immediate threat).
+      const botPos = bot.entity?.position
+      if (botPos) {
+        const currentTarget = getPlayer(currentPlayerAttackTarget)
+        const newDist = attacker.entity?.position?.distanceTo(botPos) ?? Infinity
+        const curDist = currentTarget?.entity?.position?.distanceTo(botPos) ?? Infinity
+        if (newDist >= curDist) {
+          log.debug('player_attack_suppressed', {
+            incoming: attacker.name, current: currentPlayerAttackTarget,
+            newDist: Math.round(newDist), curDist: Math.round(curDist),
+          })
+          return  // stay on the closer current target
+        }
+      } else {
+        return  // no position data, don't switch
+      }
+    }
+
     if (now - lastHitChatAt >= HIT_CHAT_COOLDOWN_MS) {
       safeChat(`That's it, ${attacker.name}.`)
       lastHitChatAt = now
     }
+    currentPlayerAttackTarget = attacker.name
     replaceTask('attacking', () => taskAttackPlayer(attacker.entity, attacker.name))
   } else {
     if (now - lastHitChatAt >= HIT_CHAT_COOLDOWN_MS) {
@@ -776,11 +796,20 @@ function rememberHazard(hazard) {
 }
 
 bot.on('health', () => {
-  // Immediate reaction — don't wait for the next 1s state tick
-  if (bot.health <= 4 && taskBusy) {
-    safeChat('Critical health — retreating!')
-    cancelCurrentTask()  // atomically supersede ownership + stop movement
-    setGoal('resting', { source: 'health_event', reason: 'critical_hp' })
+  const hp   = bot.health
+  const prev = prevHp ?? hp
+  prevHp = hp
+
+  const sharpDrop = (prev - hp) >= 2
+  const critical  = hp <= 4
+
+  // Stage a high-priority flag for processDamageWindow instead of acting directly.
+  // Direct action (cancelCurrentTask + setGoal) here races processDamageWindow's
+  // escape reaction, cancelling it on every lava tick and causing goal oscillation.
+  // processDamageWindow will bypass its cooldown for this flag and launch a real escape.
+  if ((sharpDrop || critical) && (!criticalHpFlag || criticalHpFlag.at < Date.now() - 500)) {
+    criticalHpFlag = { at: Date.now(), hp }
+    log.warn('critical_hp_queued', { hp, prev, sharpDrop, critical })
   }
 })
 
@@ -834,14 +863,15 @@ function cancelCurrentTask() {
   // it is no longer the owner.
   currentTaskToken   = null
   currentTaskContext = null
-  taskBusy = false
   if (oldCtx?.watchdog) clearTimeout(oldCtx.watchdog)
   if (oldCtx && state.goal === oldCtx.goalName) setGoal('idle', { source: 'cancel_task', token: oldCtx.token })
-  // Now stop movement. Old task's goto() Promise will reject on next microtask;
-  // its catch handler will check ownership, see it lost, and no-op.
+  // Stop movement before clearing taskBusy so no runTask() call can slip through the
+  // `if (taskBusy) return false` guard while the old task's pathfinder/pvp is still
+  // unwinding. The old task's deferred catch handlers will see ownership lost and no-op.
   movement.forceStop('cancel')
   try { bot.pvp.stop() } catch {}
   bot.clearControlStates()
+  taskBusy = false  // cleared last: gate stays closed until all cleanup is done
 }
 
 // Atomic task replacement: cancel current task and start a new one.
@@ -885,7 +915,7 @@ function runTask(goalName, fn, { silent = false } = {}) {
     if (!isOwner(myToken)) return  // superseded; observational-only
     log.warn('task_watchdog_kill', { goal: goalName, durationMs: Date.now() - myCtx.startedAt, cid: myCtx.correlationId })
     if (!silent) safeChat('Timed out. Resetting.')
-    recoveryEngine.recover('TASK', { source: 'watchdog', goalName, cid: myCtx.correlationId })
+    recoveryEngine.report('TASK_HUNG', { source: 'watchdog', goalName, cid: myCtx.correlationId })
   }, 90000)
 
   fn().then(() => {
@@ -917,7 +947,7 @@ function runTask(goalName, fn, { silent = false } = {}) {
       if (['exploring', 'mining', 'gathering'].includes(goalName) && n >= EXPLORE_FAIL_THRESHOLD) {
         log.warn('stuck_detected_scheduling_escape', { goal: goalName, consecutive: n })
         taskFailureCounts.set(goalName, 0)
-        recoveryEngine.recover('MOVEMENT', { source: 'timeout_streak', goalName, consecutive: n, cid: myCtx.correlationId })
+        recoveryEngine.report('MOVEMENT_TIMEOUT_STREAK', { source: 'timeout_streak', goalName, consecutive: n, cid: myCtx.correlationId })
       }
     } else {
       taskFailureCounts.set(goalName, 0)
@@ -1149,12 +1179,7 @@ async function taskAttackMobs() {
   const weapon = await equipBestWeapon()
   console.log(`[${BOT_NAME}] Attacking ${mob.name} with ${weapon || 'fists'}`)
   safeChat(`Fighting ${mob.name}.`)
-  bot.pvp.attack(mob)
-  // 30s timeout — if stoppedAttacking never fires (mob glitches, entity invalid), don't hang
-  await Promise.race([
-    new Promise(r => bot.once('stoppedAttacking', r)),
-    new Promise(r => setTimeout(r, 30000)),
-  ])
+  await safeAttack(bot, mob, { maxMs: 10_000, label: mob.name })
 
   if (mob.isValid) safeChat('Got away.')
   else            { safeChat(`${mob.name} down.`); rememberEvent(memory, 'killed_mob', { name: mob.name }) }
@@ -1166,12 +1191,7 @@ async function taskAttackPlayer(entity, username) {
   const weapon = await equipBestWeapon()
   console.log(`[${BOT_NAME}] Attacking player ${username} with ${weapon || 'fists'}`)
   safeChat(`Coming for you, ${username}.`)
-  bot.pvp.attack(entity)
-  // 30s timeout — if stoppedAttacking never fires (player disconnects, entity invalid), don't hang
-  await Promise.race([
-    new Promise(r => bot.once('stoppedAttacking', r)),
-    new Promise(r => setTimeout(r, 30000)),
-  ])
+  await safeAttack(bot, entity, { maxMs: 10_000, label: username })
 
   // Reduce anger after fighting
   const rec = anger.get(username)
@@ -1607,7 +1627,7 @@ async function taskEscape() {
   safeChat('Stuck — escaping.')
 
   // Phase 1: locomotion micro-escape first (fast, no pathfinder)
-  if (locomotionRecovery && scan) {
+  if (locomotionRecovery && scan?.valid !== false) {
     log.info('escape_attempt', { method: 'locomotion_phase', stuckClass })
     await locomotionRecovery.runHazardEscape(stuckClass, scan, 'task_escape')
     await new Promise(r => setTimeout(r, 300))
@@ -1996,6 +2016,9 @@ function startPerceptionLoop() {
       return
     }
 
+    // Don't act on an invalid scan — position is NaN/null, all block reads were junk.
+    if (!lastEnvScan.valid) return
+
     // Auto-trigger hazard escape when standing in lava and not already reacting
     if (lastEnvScan.feetBlock === 'lava' || lastEnvScan.headBlock === 'lava') {
       const now = Date.now()
@@ -2031,7 +2054,7 @@ function startActivityWatchdog() {
       return
     }
     log.warn('activity_watchdog_reset', { idleMs: elapsed, goal: state.goal })
-    recoveryEngine.recover('IDLE', { source: 'activity_watchdog', idleMs: elapsed })
+    recoveryEngine.report('IDLE', { source: 'activity_watchdog', idleMs: elapsed })
     state.lastActivityAt = Date.now()
   }, ACTIVITY_CHECK_INTERVAL_MS)
 }
@@ -2046,7 +2069,7 @@ async function taskBlindSurvival() {
   log.warn('blind_survival_start', { livenessState: liveness.getState(), stuckClass: stuck, risk: scan?.locomotionRisk ?? null })
   safeChat('Taking hits. Moving.')
 
-  if (locomotionRecovery && scan) {
+  if (locomotionRecovery && scan?.valid !== false) {
     // Use perception-aware escape rather than random yaw
     await locomotionRecovery.runHazardEscape(stuck, scan, 'blind_survival')
   } else {
@@ -2088,7 +2111,16 @@ function startThreatLoop() {
 function startStateLoop() {
   const hpWatchdog = createHealthIntegrityWatchdog(
     bot, log,
-    () => { replaceTask('blind_survival', taskBlindSurvival, { silent: true }) },
+    () => {
+      // Silent HP drain — the normal damage pipeline couldn't react. Report it; the
+      // arbiter routes: structurally-invalid position ⇒ DESYNC (reconnect, no maneuver
+      // can help); valid position ⇒ CRITICAL_HP (blind-survival sprint away).
+      if (!isValidVec(bot.entity?.position)) {
+        recoveryEngine.report('DESYNC', { source: 'silent_damage', hp: bot.health })
+      } else {
+        recoveryEngine.report('CRITICAL_HP', { source: 'silent_damage', hp: bot.health })
+      }
+    },
     () => lastReactionAt
   )
 
@@ -2188,6 +2220,9 @@ function startStateLoop() {
 
 // ── Agent Loop (250 ms) ────────────────────────────────────────────────────────
 
+// Goals that block auto-follow-resume — bot must finish evading/fighting/resting first.
+const FOLLOW_BLOCK_GOALS = new Set(['evading', 'fleeing', 'attacking', 'resting'])
+
 function startAgentLoop() {
   let prevGoal = 'idle'
   let lostTicks = 0           // grace period before "Lost you"
@@ -2202,9 +2237,10 @@ function startAgentLoop() {
     liveness.tick()
 
     // Auto-resume follow if we have a follow target but no active task or goal.
-    // This survives ALL interruptions — counter-attacks, auto-eat, resting, autonomous
-    // tasks, etc. The user has to explicitly say "stop" to clear followTarget.
-    if (state.followTarget && state.goal === 'idle' && !taskBusy) {
+    // This survives ALL interruptions — counter-attacks, auto-eat, autonomous tasks, etc.
+    // Guard: never resume following while the bot is evading, fleeing, attacking, or
+    // resting — these goals must run to completion before the follow loop re-engages.
+    if (state.followTarget && state.goal === 'idle' && !taskBusy && !FOLLOW_BLOCK_GOALS.has(state.goal)) {
       log.info('follow_auto_resumed', { target: state.followTarget, prevGoal })
       setGoal('following', { source: 'agent_loop', reason: 'follow_auto_resume' })
     }

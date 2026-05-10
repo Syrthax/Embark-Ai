@@ -89,9 +89,13 @@ module.exports = function createLocomotionRecovery(bot, log) {
   async function runEscapeSequence(label = 'sequence', perception = null) {
     log.info('escape_attempt', { method: 'sequence_start', label })
 
+    // Treat an invalid scan (NaN position window) the same as no scan — don't derive
+    // a yaw from the default-North junk vector.
+    const safePerception = perception?.valid !== false ? perception : null
+
     // Use perception escape vector to face safest direction first
-    if (perception?.escapeVector) {
-      const ev = perception.escapeVector
+    if (safePerception?.escapeVector) {
+      const ev = safePerception.escapeVector
       if (ev.dx !== 0 || ev.dz !== 0) {
         const yaw = Math.atan2(-ev.dx, -ev.dz)
         _orient(yaw)
@@ -100,6 +104,7 @@ module.exports = function createLocomotionRecovery(bot, log) {
     }
 
     // Escalating ladder: each step creates more displacement
+    // (safePerception already consumed above for orientation)
     await tryJumpEscape(label)
     await new Promise(r => setTimeout(r, 150))
     await tryStrafeEscape('left', label)
@@ -118,11 +123,15 @@ module.exports = function createLocomotionRecovery(bot, log) {
   async function runHazardEscape(stuckClass, perception = null, label = 'hazard_escape') {
     log.info('escape_attempt', { method: 'hazard_specific', stuckClass, label })
 
+    // Treat an invalid scan (NaN position window) the same as no scan — don't derive
+    // a yaw from the default-North junk vector in the escape vector field.
+    const safePerception = perception?.valid !== false ? perception : null
+
     switch (stuckClass) {
       case 'lava_immobilization':
       case 'lava_proximity': {
         // Lava: jump + sprint away from lava, use escape vector if known
-        const ev = perception?.escapeVector
+        const ev = safePerception?.escapeVector
         if (ev) {
           await tryDirectedEscape(
             (bot.entity?.position?.x || 0) - ev.dx * 5,
@@ -139,7 +148,7 @@ module.exports = function createLocomotionRecovery(bot, log) {
 
       case 'collision_deadlock':
         // Trapped: try all 4 directions
-        await runEscapeSequence(label, perception)
+        await runEscapeSequence(label, safePerception)
         break
 
       case 'terrain_deadlock':
@@ -162,7 +171,7 @@ module.exports = function createLocomotionRecovery(bot, log) {
         break
 
       default:
-        await runEscapeSequence(label, perception)
+        await runEscapeSequence(label, safePerception)
     }
 
     log.info('escape_success', { method: 'hazard_escape_done', stuckClass, label })

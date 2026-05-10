@@ -294,6 +294,7 @@ These are low-risk cleanups the **`code-quality`** subagent picks up opportunist
 - Remove vestigial `recoveryAttempts` (bot.js:176) — incremented, never read for decisions.
 - Remove vestigial `unknownHitCount` / `unknownHitFirstAt` (bot.js:294-295) — already mentioned in diagnosis as dead.
 - Re-evaluate `INTENT_PATTERNS` in `engine.js` — pre-LLM classifier may be redundant with Featherless flow.
+- Split `taskBusy` into a private `taskLock` (guards `runTask` entry) and a public `botEngaged` flag (read by watchdogs / react functions to check if a task is running) — the two meanings currently collide in 15+ places. **Do not bundle with the `cancelCurrentTask` clear-last fix** (already done).
 - Convert `memory.js` `fs.writeFileSync` (memory.js:22) to debounced async writes — diagnosis F10.
 - Eliminate the duplicate `try { bot.pathfinder.stop() } catch {}` block (7 sites: bot.js:739, 803, 931, 1623, 2004, 2048, 2071) — superseded automatically when MovementController lands.
 - Eliminate the duplicate `await awaitValidPosition()` prefix (4 sites: bot.js:974, 1503, 1582, 1633) — superseded by EntityLivenessMonitor.
