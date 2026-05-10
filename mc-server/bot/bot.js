@@ -22,6 +22,7 @@ const createGoalRegistry             = require('./goalRegistry')
 const createRecoveryEngine           = require('./recoveryEngine')
 const createEnvironmentPerception    = require('./environmentPerception')
 const createLocomotionRecovery       = require('./locomotionRecovery')
+const createDamagePipeline           = require('./damagePipeline')
 
 // ── Configuration via env ─────────────────────────────────────────────────────
 const BOT_NAME    = process.env.BOT_NAME    || 'Ember'
@@ -176,13 +177,9 @@ bot.once('spawn', async () => {
   if (RECOVERY_CHAIN_ID) {
     log.info('recovery_chain_active', { chainId: RECOVERY_CHAIN_ID })
   }
-  llmEnabled = await checkOllama()
-  log.info('llm_check', { model: getModelName(), connected: llmEnabled })
 
-  safeChat(llmEnabled ? `${BOT_NAME} online (${getModelName()}).` : 'LLM offline — using fallback commands.')
-  rememberLocation(memory, 'spawn', bot.entity.position)
-  rememberEvent(memory, 'spawned', { model: getModelName() })
-
+  // Bring up the long-lived components before the (slow) LLM connectivity check so the
+  // damage pipeline's entityHurt/health listeners + classifier are live from spawn.
   recoveryEngine = createRecoveryEngine({
     bot, movement, state, log,
     getTaskContext: () => ({ taskBusy, currentTaskToken }),
@@ -197,6 +194,26 @@ bot.once('spawn', async () => {
 
   envPerception      = createEnvironmentPerception(bot, log)
   locomotionRecovery = createLocomotionRecovery(bot, log)
+
+  damagePipeline = createDamagePipeline({
+    bot, log, state, liveness,
+    getEnvPerception: () => envPerception,
+    getLastEnvScan:   () => lastEnvScan,
+    isTaskBusy:       () => taskBusy,
+    replaceTask,
+    safeChat, safeFloor, isValidVec,
+    getPlayer,
+    bumpAnger, ANGER_HIT, ANGER_ATTACK_LEVEL,
+    HAZARD_BLOCKS, HOSTILE_MOB_NAMES, BOT_NAME,
+    tasks: { taskAttackPlayer, taskAttackMobs, taskFlee, taskEvadeHazard },
+  })
+
+  llmEnabled = await checkOllama()
+  log.info('llm_check', { model: getModelName(), connected: llmEnabled })
+
+  safeChat(llmEnabled ? `${BOT_NAME} online (${getModelName()}).` : 'LLM offline — using fallback commands.')
+  rememberLocation(memory, 'spawn', bot.entity.position)
+  rememberEvent(memory, 'spawned', { model: getModelName() })
 
   startStateLoop()
   startAgentLoop()
@@ -241,6 +258,7 @@ let recoveryAttempts    = 0
 let recoveryEngine      = null  // initialized in spawn handler after task functions are available
 let envPerception       = null  // initialized in spawn handler
 let locomotionRecovery  = null  // initialized in spawn handler
+let damagePipeline      = null  // initialized in spawn handler
 
 // Last full environment scan — refreshed every PERCEPTION_INTERVAL_MS
 let lastEnvScan         = null
@@ -334,9 +352,9 @@ function buildFreezeSnapshot(reason) {
     followTarget:     state.followTarget,
 
     // Damage state
-    damageState,
-    damageWindowSize: damageWindow.length,
-    msSinceLastReaction: now - lastReactionAt,
+    damageState:         damagePipeline?.getDamageState() ?? 'safe',
+    damageWindowSize:    damagePipeline?.getDamageWindowSize() ?? 0,
+    msSinceLastReaction: damagePipeline ? now - damagePipeline.getLastReactionAt() : null,
 
     // Pathfinder
     pathActive:       !!bot.pathfinder?.goal,
@@ -406,30 +424,13 @@ function startFreezeForensics() {
 
 // ── Environmental Hazards ────────────────────────────────────────────────────
 // Blocks that damage the bot just by being adjacent / inside / on top of them.
-// Used by entityHurt's unknown-damage branch and by Movements.blocksToAvoid.
+// Used by Movements.blocksToAvoid (makeMovements) and passed to the damage pipeline
+// (findNearbyHazard / unknown-damage branch live in damagePipeline.js).
 const HAZARD_BLOCKS = new Set([
   'cactus', 'fire', 'soul_fire', 'lava', 'magma_block',
   'sweet_berry_bush', 'wither_rose', 'powder_snow',
   'campfire', 'soul_campfire',
 ])
-
-// Scan a 7×4×7 box around the bot for hazardous blocks. Returns the closest one or null.
-function findNearbyHazard(radius = 3) {
-  if (!bot.entity) return null
-  const pos = bot.entity.position
-  let nearest = null, minDist = Infinity
-  for (let dx = -radius; dx <= radius; dx++) {
-    for (let dy = -1; dy <= 2; dy++) {  // feet, body, head
-      for (let dz = -radius; dz <= radius; dz++) {
-        const block = bot.blockAt(pos.offset(dx, dy, dz))
-        if (!block || !HAZARD_BLOCKS.has(block.name)) continue
-        const d = block.position.distanceTo(pos)
-        if (d < minDist) { minDist = d; nearest = { block, dist: d, name: block.name } }
-      }
-    }
-  }
-  return nearest
-}
 
 // ── Anger / Defense System ────────────────────────────────────────────────────
 
@@ -478,340 +479,11 @@ function maybeAttackForAnger(username) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DAMAGE PIPELINE — capture / classify / react (decoupled, cooldown-gated)
-//
-// Architecture (replaces the old in-line entityHurt reaction):
-//
-//   raw entityHurt event ──► captureDamageEvent() ──► damageWindow[]
-//                                                         │
-//                                              every 500ms, processDamageWindow():
-//                                                         │
-//                                                  trim window to last 1.5s
-//                                                  enter REACTING / HURT / SAFE
-//                                                  classifyIncident(window)
-//                                                  if reactionCooldown elapsed:
-//                                                     react ONCE per incident
-//
-// The reaction cooldown (3s) makes the cactus-loop / lava-loop impossible:
-// we react once, take 3s to step out, then re-evaluate. No spam, no recursion.
+// DAMAGE PIPELINE lives in damagePipeline.js — created in the spawn handler as
+// `damagePipeline`. It owns the entityHurt/health listeners and the 500ms
+// classifier. bot.js keeps death/respawn/forcedMove (mixed concerns) below and
+// calls damagePipeline.flushDamageState() from respawn/forcedMove.
 // ─────────────────────────────────────────────────────────────────────────────
-
-const DAMAGE_WINDOW_MS    = 1500   // damage events within this window are one incident
-const REACTION_COOLDOWN_MS = 3000  // never react more often than this
-const HAZARD_MEMORY_MS    = 60000  // hazard zones remembered for 1 min
-
-// Cooldowns for chat / arm-swing (separate from reaction cooldown)
-let lastHitChatAt      = 0
-let lastCounterPunchAt = 0
-let currentPlayerAttackTarget = null  // username of the player we're currently in goal=attacking against
-const HIT_CHAT_COOLDOWN_MS      = 4000
-const COUNTER_PUNCH_COOLDOWN_MS = 1500
-
-// Damage state machine
-const damageWindow = []       // recent raw damage event captures
-const hazardZones  = []       // { x, y, z, type, ts } — places we took env damage
-let damageState     = 'safe'  // safe | hurt | reacting
-let lastReactionAt  = 0
-let damageCorrelationCounter = 0
-// Single damage-reaction authority (Fix 4): health event sets this flag instead of
-// acting directly. processDamageWindow reads it to bypass the cooldown and react
-// with a real escape. Prevents the health handler racing processDamageWindow.
-let criticalHpFlag  = null    // { at: number, hp: number } | null
-let prevHp          = null    // tracks last seen HP for sharp-drop detection
-
-// === Helpers for context capture ===
-
-function getNearestNonBotPlayerWithin(maxDist) {
-  if (!bot.entity) return null
-  let nearest = null, minDist = maxDist
-  for (const name in bot.players) {
-    if (name === BOT_NAME) continue
-    const p = bot.players[name]
-    if (!p?.entity) continue
-    const d = p.entity.position.distanceTo(bot.entity.position)
-    if (d < minDist) { minDist = d; nearest = { name, entity: p.entity, dist: d } }
-  }
-  return nearest
-}
-
-function getNearestHostileMobWithin(maxDist) {
-  if (!bot.entity) return null
-  return bot.nearestEntity(e =>
-    e !== bot.entity && e.name && HOSTILE_MOB_NAMES.has(e.name) &&
-    e.position.distanceTo(bot.entity.position) < maxDist
-  )
-}
-
-function captureDamageEvent() {
-  const rawPos = bot.entity?.position
-  let usingCached = false
-  let pos = rawPos
-
-  if (!isValidVec(rawPos)) {
-    // Degraded mode (diagnosis §13E): instead of silently dropping the event,
-    // use liveness.getBestPosition() which returns the best available position
-    // with a quality tag. Callers that see posSource='unknown_blind' route to
-    // reactToBlind() instead of the normal reaction pipeline.
-    const best = liveness.getBestPosition()
-    if (!best) {
-      log.warn('damage_capture_skipped', {
-        reason: 'no_position_available',
-        livenessState: liveness.getState(),
-        invalidMs: liveness.getInvalidMs(),
-      })
-      return null
-    }
-    pos = best.pos
-    usingCached = best.source !== 'live'
-    if (best.source === 'unknown') {
-      // Mark as blind — classifier will fall through to reactToBlind()
-      usingCached = true
-      pos = best.pos || { x: 0, y: 0, z: 0 }
-      log.debug('damage_capture_blind', { livenessState: liveness.getState(), cacheAgeMs: liveness.getCachedAge() })
-    }
-  }
-
-  const event = {
-    at: Date.now(),
-    hp: Number(bot.health.toFixed(1)),
-    hurtTime: bot.entity?.hurtTime ?? null,
-    pos: safeFloor(pos),
-    posSource: usingCached ? 'cached' : 'live',
-    velocity: isValidVec(bot.entity?.velocity) ? {
-      x: Number(bot.entity.velocity.x.toFixed(2)),
-      y: Number(bot.entity.velocity.y.toFixed(2)),
-      z: Number(bot.entity.velocity.z.toFixed(2)),
-    } : null,
-    nearestPlayer: getNearestNonBotPlayerWithin(5),
-    nearestHostileMob: getNearestHostileMobWithin(6),
-    hazard: findNearbyHazard(2),
-    inWater: !!bot.entity?.isInWater,
-    inLava: !!bot.entity?.isInLava,
-  }
-  if (usingCached) log.debug('damage_capture_using_cached_pos', { cachedAgeMs: liveness.getCachedAge(), livenessState: liveness.getState() })
-  return event
-}
-
-// === Raw event listener — only captures, never reacts ===
-
-bot.on('entityHurt', (entity) => {
-  if (entity !== bot.entity) return
-  const evt = captureDamageEvent()
-  if (!evt) return
-  damageWindow.push(evt)
-  // Use trace level — these events are high-frequency; not useful as user-visible info
-  log.trace('damage_raw', {
-    hp: evt.hp,
-    player: evt.nearestPlayer?.name || null,
-    mob: evt.nearestHostileMob?.name || null,
-    hazard: evt.hazard?.name || null,
-    inLava: evt.inLava,
-  })
-})
-
-// === Periodic classifier — runs every 500 ms ===
-
-setInterval(processDamageWindow, 500)
-
-function processDamageWindow() {
-  // Trim window to last DAMAGE_WINDOW_MS
-  const cutoff = Date.now() - DAMAGE_WINDOW_MS
-  while (damageWindow.length > 0 && damageWindow[0].at < cutoff) damageWindow.shift()
-
-  // Trim hazard memory
-  const hzCutoff = Date.now() - HAZARD_MEMORY_MS
-  while (hazardZones.length > 0 && hazardZones[0].ts < hzCutoff) hazardZones.shift()
-
-  if (damageWindow.length === 0) {
-    if (damageState !== 'safe') {
-      log.info('damage_state_change', { from: damageState, to: 'safe' })
-      damageState = 'safe'
-    }
-    return
-  }
-
-  if (damageState === 'safe') {
-    log.info('damage_state_change', { from: 'safe', to: 'hurt' })
-    damageState = 'hurt'
-  }
-
-  // Reaction cooldown: don't act on every tick.
-  // Priority bypass: if the health handler flagged a critical HP event that is newer
-  // than our last reaction, skip the cooldown for this one incident only.
-  const sinceReaction = Date.now() - lastReactionAt
-  if (sinceReaction < REACTION_COOLDOWN_MS) {
-    if (!criticalHpFlag || criticalHpFlag.at <= lastReactionAt) return
-    log.warn('critical_hp_bypass', { hp: criticalHpFlag.hp, sinceReaction })
-    criticalHpFlag = null
-  }
-
-  // Classify and react
-  const incident = classifyIncident(damageWindow)
-  const incidentCid = ++damageCorrelationCounter
-  log.info('damage_incident', {
-    type: incident.type,
-    hits: damageWindow.length,
-    hp: bot.health,
-    detail: incident.summary,
-    cid: incidentCid,
-  })
-  lastReactionAt = Date.now()
-  damageState = 'reacting'
-  reactToIncident(incident)
-}
-
-function classifyIncident(events) {
-  // Check player consistency: same player nearby in all events
-  const playerNames = events.map(e => e.nearestPlayer?.name).filter(Boolean)
-  if (playerNames.length === events.length && new Set(playerNames).size === 1) {
-    const attacker = events[events.length - 1].nearestPlayer
-    return { type: 'player', attacker, summary: { player: attacker.name } }
-  }
-
-  // Mob consistency
-  const mobNames = events.map(e => e.nearestHostileMob?.name).filter(Boolean)
-  if (mobNames.length === events.length && new Set(mobNames).size === 1) {
-    const mob = events[events.length - 1].nearestHostileMob
-    return { type: 'mob', attacker: mob, summary: { mob: mob.name } }
-  }
-
-  // Lava / fire detection from entity flags
-  if (events.some(e => e.inLava)) {
-    return { type: 'environmental', hazard: { name: 'lava', block: bot.entity }, summary: { hazard: 'lava' } }
-  }
-
-  // Hazard block detection
-  const hazards = events.map(e => e.hazard).filter(Boolean)
-  if (hazards.length > 0) {
-    const hz = hazards[hazards.length - 1]
-    return { type: 'environmental', hazard: hz, summary: { hazard: hz.name } }
-  }
-
-  return { type: 'unknown', summary: {} }
-}
-
-function reactToIncident(incident) {
-  switch (incident.type) {
-    case 'player':        return reactToPlayerAttack(incident.attacker)
-    case 'mob':           return reactToMobAttack(incident.attacker)
-    case 'environmental': return reactToEnvironmental(incident.hazard)
-    case 'unknown':       return reactToUnknownDamage()
-  }
-}
-
-function reactToPlayerAttack(attacker) {
-  const rec = bumpAnger(attacker.name, ANGER_HIT, 'attacked me')
-  const now = Date.now()
-  if (rec.level >= ANGER_ATTACK_LEVEL) {
-    // Symmetric guard matching reactToMobAttack: don't restart the attack task on every hit.
-    if (taskBusy && state.goal === 'attacking') {
-      if (currentPlayerAttackTarget === attacker.name) return  // already engaged with this player
-
-      // Different player is hitting us mid-attack. Switch only if the new attacker is
-      // closer than our current target (they're the more immediate threat).
-      const botPos = bot.entity?.position
-      if (botPos) {
-        const currentTarget = getPlayer(currentPlayerAttackTarget)
-        const newDist = attacker.entity?.position?.distanceTo(botPos) ?? Infinity
-        const curDist = currentTarget?.entity?.position?.distanceTo(botPos) ?? Infinity
-        if (newDist >= curDist) {
-          log.debug('player_attack_suppressed', {
-            incoming: attacker.name, current: currentPlayerAttackTarget,
-            newDist: Math.round(newDist), curDist: Math.round(curDist),
-          })
-          return  // stay on the closer current target
-        }
-      } else {
-        return  // no position data, don't switch
-      }
-    }
-
-    if (now - lastHitChatAt >= HIT_CHAT_COOLDOWN_MS) {
-      safeChat(`That's it, ${attacker.name}.`)
-      lastHitChatAt = now
-    }
-    currentPlayerAttackTarget = attacker.name
-    replaceTask('attacking', () => taskAttackPlayer(attacker.entity, attacker.name))
-  } else {
-    if (now - lastHitChatAt >= HIT_CHAT_COOLDOWN_MS) {
-      safeChat(`Stop hitting me, ${attacker.name}!`)
-      lastHitChatAt = now
-    }
-    if (now - lastCounterPunchAt >= COUNTER_PUNCH_COOLDOWN_MS) {
-      try { bot.attack(attacker.entity) } catch (e) {
-        log.warn('counter_attack_failed', { message: e.message })
-      }
-      lastCounterPunchAt = now
-    }
-  }
-}
-
-function reactToMobAttack(mob) {
-  if (taskBusy && state.goal === 'attacking') return  // already engaged
-  if (state.energy < 30) {
-    safeChat(`A ${mob.name}! Backing off.`)
-    log.info('mob_hit_decision', { mob: mob.name, choice: 'flee', energy: state.energy })
-    replaceTask('fleeing', taskFlee)
-  } else {
-    safeChat(`A ${mob.name}. Fighting back.`)
-    log.info('mob_hit_decision', { mob: mob.name, choice: 'fight', energy: state.energy })
-    replaceTask('attacking', () => taskAttackMobs())
-  }
-}
-
-function reactToEnvironmental(hazard) {
-  rememberHazard(hazard)
-  // Also record in the environmental perception hazard memory for path avoidance
-  if (hazard?.block?.position && envPerception) {
-    const hp = hazard.block.position
-    envPerception.recordHazardPosition(hp.x, hp.y, hp.z, 'damage')
-  }
-  log.info('hazard_detected', {
-    name: hazard?.name || 'unknown',
-    knownZones: hazardZones.length,
-    envRisk: lastEnvScan?.locomotionRisk ?? null,
-  })
-  replaceTask('evading', () => taskEvadeHazard(hazard))
-}
-
-function reactToUnknownDamage() {
-  // No identifiable source. If HP is dropping fast, retreat.
-  if (bot.health < 12) {
-    log.warn('unknown_damage_critical_retreat', { hp: bot.health })
-    replaceTask('evading', () => taskEvadeHazard(null))
-  } else {
-    log.warn('unknown_damage_ignored_hp_ok', { hp: bot.health })
-  }
-}
-
-function rememberHazard(hazard) {
-  if (!hazard?.block?.position) return
-  const p = hazard.block.position
-  hazardZones.push({
-    x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z),
-    type: hazard.name,
-    ts: Date.now(),
-  })
-  while (hazardZones.length > 50) hazardZones.shift()
-}
-
-bot.on('health', () => {
-  const hp   = bot.health
-  const prev = prevHp ?? hp
-  prevHp = hp
-
-  const sharpDrop = (prev - hp) >= 2
-  const critical  = hp <= 4
-
-  // Stage a high-priority flag for processDamageWindow instead of acting directly.
-  // Direct action (cancelCurrentTask + setGoal) here races processDamageWindow's
-  // escape reaction, cancelling it on every lava tick and causing goal oscillation.
-  // processDamageWindow will bypass its cooldown for this flag and launch a real escape.
-  if ((sharpDrop || critical) && (!criticalHpFlag || criticalHpFlag.at < Date.now() - 500)) {
-    criticalHpFlag = { at: Date.now(), hp }
-    log.warn('critical_hp_queued', { hp, prev, sharpDrop, critical })
-  }
-})
 
 bot.on('death', () => {
   log.warn('died', { lastGoal: state.goal })
@@ -824,8 +496,7 @@ bot.on('death', () => {
 bot.on('respawn', () => {
   log.info('respawned', { pos: safeFloor(bot.entity?.position) })
   // Discard any damage events from the pre-respawn life — they refer to a stale world.
-  damageWindow.length = 0
-  damageState = 'safe'
+  damagePipeline?.flushDamageState()
   safeChat("I'm back. That hurt.")
 })
 
@@ -837,8 +508,7 @@ bot.on('forcedMove', () => {
     newPos: safeFloor(bot.entity?.position),
     valid: isValidVec(bot.entity?.position),
   })
-  damageWindow.length = 0
-  damageState = 'safe'
+  damagePipeline?.flushDamageState()
   // The current task's path was for the OLD location — invalidate it atomically.
   // cancelCurrentTask supersedes ownership; the task's microtask-deferred catch
   // will see it lost ownership and skip cleanup, leaving us in clean idle state.
@@ -2121,7 +1791,7 @@ function startStateLoop() {
         recoveryEngine.report('CRITICAL_HP', { source: 'silent_damage', hp: bot.health })
       }
     },
-    () => lastReactionAt
+    () => damagePipeline?.getLastReactionAt() ?? 0
   )
 
   setInterval(() => {
@@ -2200,19 +1870,15 @@ function startStateLoop() {
         // Pathfinder state
         pathActive: !!(bot.pathfinder?.goal),
         isMoving: !!bot.pathfinder?.isMoving?.(),
-        // Damage pipeline (NEW)
-        damageState,                                          // safe | hurt | reacting
-        recentDamageHits: damageWindow.length,                // events in current 1.5s window
-        msSinceLastReaction: Date.now() - lastReactionAt,
-        knownHazardZones: hazardZones.length,
+        // Damage pipeline
+        damageState:         damagePipeline?.getDamageState() ?? 'safe',     // safe | hurt | reacting
+        recentDamageHits:    damagePipeline?.getDamageWindowSize() ?? 0,      // events in current 1.5s window
+        msSinceLastReaction: damagePipeline ? Date.now() - damagePipeline.getLastReactionAt() : null,
+        knownHazardZones:    damagePipeline?.getHazardZonesCount() ?? 0,
         // Recovery
         recoveryAttempts,
         // Anti-spam
-        cooldowns: {
-          hitChat: Math.max(0, HIT_CHAT_COOLDOWN_MS - (Date.now() - lastHitChatAt)),
-          counterPunch: Math.max(0, COUNTER_PUNCH_COOLDOWN_MS - (Date.now() - lastCounterPunchAt)),
-          reaction: Math.max(0, REACTION_COOLDOWN_MS - (Date.now() - lastReactionAt)),
-        },
+        cooldowns: damagePipeline?.getCooldowns() ?? { hitChat: 0, counterPunch: 0, reaction: 0 },
       })
     }
   }, 1000)
