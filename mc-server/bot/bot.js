@@ -24,6 +24,7 @@ const createEnvironmentPerception    = require('./environmentPerception')
 const createLocomotionRecovery       = require('./locomotionRecovery')
 const createDamagePipeline           = require('./damagePipeline')
 const createTasks                    = require('./tasks')
+const createPositionGuard            = require('./positionGuard')
 
 // ── Configuration via env ─────────────────────────────────────────────────────
 const BOT_NAME    = process.env.BOT_NAME    || 'Ember'
@@ -226,6 +227,7 @@ bot.once('spawn', async () => {
   startHealthBeacon()
   startPerceptionLoop()
   createFatalDesyncRecovery(bot, liveness, log, (ctx) => recoveryEngine.report('DESYNC', ctx))
+  createPositionGuard(bot, liveness, log, recoveryEngine)
 
   // Post-spawn integrity check: confirm entity liveness reaches LIVE_VALID within 30s.
   // A failure here means position/entity data never arrived — likely a login-phase desync.
