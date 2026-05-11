@@ -1016,15 +1016,17 @@ async function actWorldSettings() {
     const choice = await modalSelect('World Settings', items)
     if (!choice || choice === '__cancel__') return
     if (choice === '__save__') {
-      writeServerProps(draft)
+      const toSave = { ...draft }
+      if (toSave.gamemode !== props.gamemode) toSave['force-gamemode'] = 'true'
+      writeServerProps(toSave)
       await modalMessage('{green-fg}Saved to server.properties.{/}\nRestart server to apply.', 'green')
       return
     }
 
     const def = WORLD_DEFS.find(d => d.key === choice)
     if (def.type === 'cycle') {
-      const idx = def.options.indexOf(draft[def.key])
-      draft[def.key] = def.options[(idx + 1) % def.options.length]
+      const picked = await modalSelect(def.label, def.options.map(o => ({ label: o, value: o })))
+      if (picked) draft[def.key] = picked
     } else if (def.type === 'text') {
       const val = await modalPrompt(`${def.label} (current: "${draft[def.key] || 'blank'}")`, draft[def.key] || '')
       if (val !== null) draft[def.key] = val.trim()

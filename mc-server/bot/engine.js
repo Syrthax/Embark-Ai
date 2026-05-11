@@ -191,8 +191,9 @@ function selectAutonomousGoal(groundedState) {
     return { action: 'craft', target: 'wooden_sword', say: 'Making a sword.' }
   }
 
-  // 8. GATHER wood — keep stockpile up if trees are around
-  if (hasLog && planksCount < 32 && !lowEnergy) {
+  // 8. GATHER wood — keep stockpile up if trees are around (skip in creative: no drops)
+  const isCreative = groundedState.gameMode === 'creative'
+  if (!isCreative && hasLog && planksCount < 32 && !lowEnergy) {
     return { action: 'gather_wood', say: pick(['Need wood.', 'Heading for that tree.']) }
   }
 

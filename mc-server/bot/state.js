@@ -74,6 +74,7 @@ function buildGroundedState(bot, state, memory, anger = new Map(), perception = 
       goal: state.goal,
       pos: { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) },
     },
+    gameMode:   bot.game?.gameMode ?? 'survival',
     inventory,          // from bot.inventory.items()   — real
     nearbyBlocks,       // from bot.findBlock()          — real
     entities,           // from bot.entities             — real

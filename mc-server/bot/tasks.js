@@ -233,16 +233,21 @@ module.exports = function createTasks(deps) {
     const ids = logIds()
     const logBlock = bot.findBlock({ matching: ids, maxDistance: 50 })
     if (!logBlock) { safeChat('No trees in range.'); return }
-    console.log(`[${BOT_NAME}] Chopping log at ${logBlock.position}`)
+    const creative = bot.game?.gameMode === 'creative'
+    console.log(`[${BOT_NAME}] Chopping log at ${logBlock.position}${creative ? ' (creative)' : ''}`)
     await navNear(logBlock.position.x, logBlock.position.y, logBlock.position.z, 2)
     const fresh = bot.blockAt(logBlock.position)
     if (fresh && ids.includes(fresh.type) && bot.canDigBlock(fresh)) {
       await safeDig(bot, fresh)
-      // Step into the drop so the item entity is auto-collected
-      await new Promise(r => setTimeout(r, 300))
-      try { await navNear(logBlock.position.x, logBlock.position.y, logBlock.position.z, 0) } catch {}
-      safeChat('Got wood.')
-      rememberEvent(memory, 'gathered_wood', {})
+      if (!creative) {
+        // Survival: step into the drop so the item entity is auto-collected
+        await new Promise(r => setTimeout(r, 300))
+        try { await navNear(logBlock.position.x, logBlock.position.y, logBlock.position.z, 0) } catch {}
+        safeChat('Got wood.')
+        rememberEvent(memory, 'gathered_wood', {})
+      } else {
+        safeChat('Cleared.')
+      }
     }
   }
 

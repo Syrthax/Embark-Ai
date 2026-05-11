@@ -1042,6 +1042,7 @@ function startAgentLoop() {
   let prevGoal = 'idle'
   let lostTicks = 0           // grace period before "Lost you"
   let prevFollowTarget = null
+  let lookTick = 0
   let followRefreshTicks = 0  // re-issue follow goal periodically — recovers from stuck pathfinder
   let stuckCheckTicks = 0
   let lastBotPos = null
@@ -1060,12 +1061,18 @@ function startAgentLoop() {
       setGoal('following', { source: 'agent_loop', reason: 'follow_auto_resume' })
     }
 
-    // Look at the player we're following, or the nearest one if just idling
-    const lookTarget = state.goal === 'following'
-      ? getPlayer(state.followTarget)
-      : getNearestPlayer()
-    if (lookTarget) {
-      try { bot.lookAt(lookTarget.entity.position.offset(0, lookTarget.entity.height, 0)) } catch {}
+    // Natural look — only when not busy, at reduced rate so Ember doesn't robotically stare
+    lookTick++
+    if (!taskBusy) {
+      let lookTarget = null
+      if (state.goal === 'following' && lookTick % 12 === 0) {
+        lookTarget = getPlayer(state.followTarget)     // glance every ~3s while following
+      } else if (state.goal === 'idle' && lookTick % 20 === 0) {
+        lookTarget = getNearestPlayer()                // rare ambient glance every ~5s
+      }
+      if (lookTarget) {
+        try { bot.lookAt(lookTarget.entity.position.offset(0, lookTarget.entity.height, 0)) } catch {}
+      }
     }
 
     if (bot.entity?.isInWater && !taskBusy) {

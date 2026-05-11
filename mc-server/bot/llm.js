@@ -13,7 +13,8 @@ const API_KEY         = process.env.FEATHERLESS_API_KEY
 const USER_AGENT      = 'project-k/1.0 (https://github.com/Syrthax/project-k)'
 
 function buildPrompt(groundedState, intent, playerMessage, botName = 'Ember') {
-  const { self, inventory, nearbyBlocks, entities, hostileMobs, droppedCount, knownLocations, anger, environment } = groundedState
+  const { self, gameMode, inventory, nearbyBlocks, entities, hostileMobs, droppedCount, knownLocations, anger, environment } = groundedState
+  const isCreative = gameMode === 'creative'
 
   const energyLabel   = self.energy < 25 ? 'CRITICAL' : self.energy < 60 ? 'hurt' : 'full'
   const hungerLabel   = self.hunger < 25 ? 'STARVING' : self.hunger < 60 ? 'hungry' : 'fed'
@@ -54,6 +55,7 @@ Respond ONLY with valid JSON. NEVER invent facts not in GROUNDED STATE.
 health: ${(self.hp ?? self.energy / 5).toFixed(1)}/20 hearts [${energyLabel}]
 hunger: ${(self.food ?? self.hunger / 5).toFixed(0)}/20 [${hungerLabel}]
 current goal: ${self.goal}
+game mode: ${gameMode}${isCreative ? ' (creative — no item drops, gathering clears space only)' : ''}
 inventory: ${invStr}
 nearby blocks: ${blocksStr}
 visible entities: ${entStr}
@@ -79,7 +81,7 @@ intent: ${intent}
 - "follow"            → come to player. Refuse if TIRED.
 - "stop"              → stop everything.
 - "explore"           → walk around.
-- "gather_wood"       → chop nearest log. Need logs nearby: ${hasLogs ? '✓' : '✗ no logs visible'}.
+- "gather_wood"       → chop nearest log${isCreative ? ' (creative: clears space, no drops)' : ''}. Need logs nearby: ${hasLogs ? '✓' : '✗ no logs visible'}.
 - "craft_planks"      → convert your logs to planks. Have logs: ${logsInInv ? '✓' : '✗ no logs in inventory'}.
 - "go_to"             → navigate to known location. Add "target":"name".
 - "remember_here"     → save current spot.
