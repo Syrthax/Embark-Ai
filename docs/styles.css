@@ -719,3 +719,63 @@ section { position: relative; z-index: 1; }
 .bullet-list .b-key { color: var(--text-muted); font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; }
 .bullet-list .b-val { color: var(--text); text-align: right; }
 
+/* ───────── Video embed ───────── */
+.demo-frame-video { position: relative; overflow: hidden; }
+
+/* ───────── Auto light mode ───────── */
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg-0: #f7faf8;
+    --bg-1: #eef5f1;
+    --bg-2: #e6f0ea;
+    --bg-3: #ddeae2;
+    --surface: rgba(230, 244, 236, 0.78);
+    --surface-solid: #e6f0ea;
+    --hairline: rgba(0, 90, 45, 0.10);
+    --hairline-strong: rgba(0, 90, 45, 0.22);
+    --border: #b8d4c4;
+    --border-strong: #96bca8;
+
+    --text: #0d1c15;
+    --text-dim: #2a4438;
+    --text-muted: #4a6858;
+    --text-faint: #7a9888;
+
+    --emerald-deep: #c8f0d8;
+    --copper-deep: #f5dcc8;
+  }
+
+  html, body { background: var(--bg-0); }
+
+  .page-bg {
+    background:
+      radial-gradient(1200px 700px at 80% -10%, rgba(62, 224, 122, 0.10), transparent 60%),
+      radial-gradient(900px 600px at -10% 30%, rgba(224, 138, 82, 0.07), transparent 60%),
+      radial-gradient(800px 800px at 50% 110%, rgba(62, 224, 122, 0.07), transparent 70%),
+      var(--bg-0);
+  }
+  .page-bg::before {
+    background-image:
+      linear-gradient(to right, rgba(0,0,0,0.04) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(0,0,0,0.04) 1px, transparent 1px);
+  }
+
+  .nav { background: rgba(247, 250, 248, 0.85); border-bottom-color: rgba(0, 90, 45, 0.12); }
+
+  .feat, .os-card, .setup-card, .kpi, .demo, .problem-item, .solution-item {
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+  }
+  .feat:hover { box-shadow: 0 12px 32px rgba(0,0,0,0.10), 0 0 0 1px rgba(62,224,122,0.12); }
+
+  .arch-wrap::before {
+    background-image:
+      linear-gradient(rgba(0,0,0,0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,0,0,0.04) 1px, transparent 1px);
+  }
+
+  .footer {
+    background: linear-gradient(180deg, transparent, rgba(180, 210, 195, 0.3));
+    border-top-color: rgba(0, 90, 45, 0.12);
+  }
+}
+

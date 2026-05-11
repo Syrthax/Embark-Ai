@@ -137,14 +137,13 @@ const Showcase = () => (
       </div>
       <div style={{maxWidth: 920, margin: '0 auto'}}>
         <div className="demo" style={{borderRadius: 10}}>
-          <div className="demo-frame" style={{aspectRatio: '16 / 9'}}>
-            <div className="badge">
-              <span style={{width: 4, height: 4, background: 'var(--emerald)', boxShadow:'0 0 4px var(--emerald)'}} />
-              chop_wood → attack_spider → resume
-            </div>
-            <div className="placeholder">drop demo.mp4 here</div>
-            <div className="play-tri" />
-            <div className="duration">unscripted · single take</div>
+          <div className="demo-frame demo-frame-video" style={{aspectRatio: '2 / 1', background: '#000', padding: 0}}>
+            <iframe
+              src="https://player.mux.com/01Qze01tWf100NYHSXM6CcWD01fkvC8NbjI9UAQypKctiYE"
+              style={{position: 'absolute', inset: 0, width: '100%', height: '100%', border: 'none'}}
+              allow="accelerometer; gyroscope; autoplay; encrypted-media; picture-in-picture"
+              allowFullScreen
+            />
           </div>
           <div className="demo-meta" style={{padding: '18px 22px'}}>
             <span className="demo-title">Chopping wood, interrupted by a spider</span>
