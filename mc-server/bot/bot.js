@@ -555,6 +555,22 @@ function replaceTask(goalName, fn, opts) {
   return runTask(goalName, fn, opts)
 }
 
+// When the user assigns Ember a new task while she's following, drop the follow
+// so the agent-loop auto-resume does not re-engage it after the task finishes.
+function interruptFollow() {
+  if (!state.followTarget) return
+  movement.stop('follow')
+  state.followTarget = null
+  setGoal('idle', { source: 'interrupt_follow', reason: 'new_task' })
+  log.info('follow_interrupted_by_task')
+}
+
+// Wrapper for fallbackCommand task dispatches: preempts follow, then runs the task.
+function taskCmd(goalName, fn, opts) {
+  interruptFollow()
+  return runTask(goalName, fn, opts)
+}
+
 // Track recent path failures by goal — repeated explore timeouts mean we're stuck.
 const taskFailureCounts = new Map()  // goalName -> consecutive failure count
 const EXPLORE_FAIL_THRESHOLD = 3
@@ -1222,6 +1238,7 @@ function executeAction(result, username, groundedState) {
     result.say = "Still busy — give me a sec."
     return
   }
+  if (taskActions.includes(result.action)) interruptFollow()
 
   switch (result.action) {
 
@@ -1323,28 +1340,28 @@ function fallbackCommand(username, message) {
   if (cmd === 'follow me')                           { if (state.energy < 25) { safeChat('Too tired.'); return }; state.followTarget = username; setGoal('following', { source: 'fallback_cmd', reason: 'follow_me' }); safeChat('Following.') }
   else if (cmd === 'stop')                           { cancelCurrentTask(); state.followTarget = null; safeChat('Stopped.') }
   else if (cmd === 'status')                         { safeChat(`Goal: ${state.goal} | E:${state.energy.toFixed(0)} H:${state.hunger.toFixed(0)} | anger:${anger.size}`) }
-  else if (cmd === 'explore')                        { if (!runTask('exploring', tasks.taskExplore)) safeChat("Busy.") }
-  else if (cmd === 'get wood' || cmd === 'chop tree'){ if (!runTask('gathering', tasks.taskGatherWood)) safeChat("Busy.") }
-  else if (cmd === 'make planks')                    { if (!runTask('crafting', tasks.taskCraftPlanks)) safeChat("Busy.") }
-  else if (cmd === 'attack' || cmd === 'fight')      { if (!runTask('attacking', tasks.taskAttackMobs)) safeChat("Busy.") }
-  else if (cmd === 'collect' || cmd === 'pick up')   { if (!runTask('collecting', tasks.taskCollectNearby)) safeChat("Busy.") }
-  else if (cmd === 'build house')                    { if (!runTask('building', tasks.taskBuildHouseSmart)) safeChat("Busy.") }
+  else if (cmd === 'explore')                        { if (!taskCmd('exploring', tasks.taskExplore)) safeChat("Busy.") }
+  else if (cmd === 'get wood' || cmd === 'chop tree'){ if (!taskCmd('gathering', tasks.taskGatherWood)) safeChat("Busy.") }
+  else if (cmd === 'make planks')                    { if (!taskCmd('crafting', tasks.taskCraftPlanks)) safeChat("Busy.") }
+  else if (cmd === 'attack' || cmd === 'fight')      { if (!taskCmd('attacking', tasks.taskAttackMobs)) safeChat("Busy.") }
+  else if (cmd === 'collect' || cmd === 'pick up')   { if (!taskCmd('collecting', tasks.taskCollectNearby)) safeChat("Busy.") }
+  else if (cmd === 'build house')                    { if (!taskCmd('building', tasks.taskBuildHouseSmart)) safeChat("Busy.") }
   else if (cmd === 'inventory')                      { const it = bot.inventory.items(); safeChat(it.length ? it.map(i=>`${i.name}x${i.count}`).join(', ') : 'Empty.') }
   else if (cmd === 'look around')                    { const gs = buildGroundedState(bot, state, memory, anger, envPerception); safeChat(`I see: ${chatSummary(gs) || 'nothing'}`) }
   else {
-    const m = cmd.match(/^craft (.+)$/);    if (m) { if (!runTask('crafting', () => tasks.taskCraftItem(m[1]))) safeChat("Busy."); return }
-    const p = cmd.match(/^place (.+)$/);    if (p) { if (!runTask('placing', () => tasks.taskPlaceBlock(p[1].trim()))) safeChat("Busy."); return }
+    const m = cmd.match(/^craft (.+)$/);    if (m) { if (!taskCmd('crafting', () => tasks.taskCraftItem(m[1]))) safeChat("Busy."); return }
+    const p = cmd.match(/^place (.+)$/);    if (p) { if (!taskCmd('placing', () => tasks.taskPlaceBlock(p[1].trim()))) safeChat("Busy."); return }
     const mn = cmd.match(/^mine (.+)$/);    if (mn) {
       const parts = mn[1].trim().match(/^(.+?)\s+(\d+)$/)
       const name = parts ? parts[1] : mn[1].trim()
       const cnt = parts ? Math.min(parseInt(parts[2]), 16) : 1
-      if (!runTask('mining', () => tasks.taskMineBlock(name, cnt))) safeChat("Busy."); return
+      if (!taskCmd('mining', () => tasks.taskMineBlock(name, cnt))) safeChat("Busy."); return
     }
-    if (cmd === 'eat')                      { if (!runTask('eating', tasks.taskEatFood)) safeChat("Busy."); return }
-    if (cmd === 'flee' || cmd === 'run')    { if (!runTask('fleeing', tasks.taskFlee)) safeChat("Busy."); return }
-    if (cmd === 'escape' || cmd === 'climb out' || cmd === 'get out') { if (!runTask('escaping', tasks.taskEscape)) safeChat("Busy."); return }
+    if (cmd === 'eat')                      { if (!taskCmd('eating', tasks.taskEatFood)) safeChat("Busy."); return }
+    if (cmd === 'flee' || cmd === 'run')    { if (!taskCmd('fleeing', tasks.taskFlee)) safeChat("Busy."); return }
+    if (cmd === 'escape' || cmd === 'climb out' || cmd === 'get out') { if (!taskCmd('escaping', tasks.taskEscape)) safeChat("Busy."); return }
     const w = cmd.match(/^where is (.+)$/); if (w) { const loc = recallLocation(memory, w[1].trim()); safeChat(loc ? `${w[1]}: ${loc.pos.x}, ${loc.pos.y}, ${loc.pos.z}` : `Don't know.`); return }
-    const g = cmd.match(/^go to (.+)$/);    if (g) { if (!runTask('going_to', () => tasks.taskGoTo(g[1].trim()))) safeChat("Busy."); else safeChat(`Going to ${g[1]}.`) }
+    const g = cmd.match(/^go to (.+)$/);    if (g) { if (!taskCmd('going_to', () => tasks.taskGoTo(g[1].trim()))) safeChat("Busy."); else safeChat(`Going to ${g[1]}.`) }
   }
 }
 

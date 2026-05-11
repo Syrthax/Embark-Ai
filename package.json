@@ -1,6 +1,6 @@
 {
   "name": "embark-ai",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Autonomous Minecraft agent powered by Featherless AI or Ollama",
   "keywords": [
     "minecraft",
