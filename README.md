@@ -22,10 +22,6 @@ Built on **Mineflayer** + **Featherless AI** (cloud) or **Ollama** (local LLM). 
 <Ember>  Got wood. Making planks. Have 32 planks. Building now.
 <Ember>  House done!
 
-<player> hey asshole
-<Ember>  Watch your mouth.
-<player> fuck you
-<Ember>  That's it. Coming for you.
 
 <player> mine 5 iron_ore
 <Ember>  On it.
