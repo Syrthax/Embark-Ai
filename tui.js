@@ -600,9 +600,11 @@ function modalCommand(title, instruction, command, note) {
 // ── Onboarding wizard ─────────────────────────────────────────────────────────
 async function runOnboarding() {
   await modalMessage(
-    `{bold}{cyan-fg}Welcome to embark-ai{/}{/bold}\n\n` +
+    `{bold}{cyan-fg}Welcome to embark-ai{/}{/bold}  {yellow-fg}[beta]{/}\n\n` +
     `Ember is an autonomous Minecraft agent powered by AI.\n` +
     `Let\'s set up your AI backend and verify your server.\n\n` +
+    `{yellow-fg}⚠ This is a beta release — some features may be\n` +
+    `  unstable. Please report issues on GitHub.{/}\n\n` +
     `{gray-fg}This takes about 2 minutes on first run.{/}`,
     'cyan'
   )
@@ -710,13 +712,14 @@ async function runOnboarding() {
   const jarPath = path.join(SERVER_DIR, SERVER_JAR)
   if (!fs.existsSync(jarPath)) {
     await modalCommand(
-      `Step 3 of 3 — Minecraft Server  (Java Edition ${MC_VERSION})`,
+      `Step 3 of 3 — Minecraft Server  (requires Java Edition ${MC_VERSION})`,
       `server.jar not found. Place it at:`,
-      `${path.join(SERVER_DIR, SERVER_JAR)}`,
-      `Download Minecraft Java Edition ${MC_VERSION} server jar\n` +
-      `from minecraft.net > Download > Minecraft Server\n` +
-      `and place it at the path above.\n\n` +
-      `Press Enter once the file is in place, or Esc to set up later.`,
+      `${jarPath}`,
+      `embark-ai requires Minecraft Java Edition ${MC_VERSION} specifically.\n` +
+      `minecraft.net only offers the latest version — search for:\n` +
+      `"Minecraft ${MC_VERSION} server jar" or use mcversions.net\n\n` +
+      `Rename the downloaded file to server.jar and place it at the path above.\n` +
+      `Press Enter once done, or Esc to set up later.`,
     )
   } else {
     await modalMessage(
@@ -766,6 +769,13 @@ async function actStartServer() {
       `{red-fg}Java ${javaVer || '?'} found — need Java 21+.{/}\nInstall: brew install openjdk@21`,
       'red'
     )
+  }
+
+  // Auto-accept the Minecraft EULA so the server doesn't exit on first run
+  const eulaPath = path.join(SERVER_DIR, 'eula.txt')
+  if (!fs.existsSync(eulaPath) || !fs.readFileSync(eulaPath, 'utf8').includes('eula=true')) {
+    fs.writeFileSync(eulaPath, '#By running embark-ai you agree to the Minecraft EULA\n#https://www.minecraft.net/en-us/eula\neula=true\n')
+    logPanel.log('{gray-fg}Accepted Minecraft EULA (eula.txt written){/}')
   }
 
   refresh(`{cyan-fg}Starting server with Java ${javaVer}...{/}`)
