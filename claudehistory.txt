@@ -1,0 +1,2229 @@
+╭─── Claude Code v2.1.126 ─────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting        │
+│                Welcome back Sarthak!               │ started                 │
+│                                                    │ ✔ Run /init to create … │
+│                      ▗ ▗   ▖ ▖                     │ ─────────────────────── │
+│                                                    │ What's new              │
+│                        ▘▘ ▝▝                       │ Added `worktree.baseRe… │
+│      Sonnet 4.6 · Claude Pro ·                     │ Added `sandbox.bwrapPa… │
+│      sarthakghosh2006@gmail.com's Organization     │ Added `parentSettingsB… │
+│                ~/projects/project-k                │ /release-notes for more │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+✻ Conversation compacted (ctrl+o for history)
+
+  ⎿  Referenced file approach.md
+  ⎿  Referenced file mc-server/bot/bot.js
+  ⎿  Read mc-server/bot/recoveryEngine.js (191 lines)
+  ⎿  Read mc-server/bot/goalRegistry.js (50 lines)
+  ⎿  Read mc-server/bot/movementController.js (111 lines)
+  ⎿  Plan file referenced (~/.claude/plans/so-as-you-can-spicy-petal.md)
+  ⎿  Skills restored (init)
+
+⏺ Let me read the current state of the key files before writing.
+
+  Read 2 files (ctrl+o to expand)
+
+⏺ Let me check the bot's disconnect/end event handlers:
+
+  Searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+⏺ Now I have everything I need. Let me build botSupervisor.js first, then update
+   cli.js, bot.js, and create recovery_report.md.
+
+⏺ Write(botSupervisor.js)
+  ⎿  Wrote 236 lines to botSupervisor.js
+       2 // botSupervisor.js — Supervised bot lifecycle manager.
+       3 // Wraps bot process spawning with:
+       5 //   - Per-class base backoff with exponential growth and a 5-mi
+         nute cap
+         t with alertrt storm prevention: ≥5 restarts in 10 minutes → hal
+       7 //   - Recovery chain IDs: each restart chain gets a unique UUID
+       8 //   - onLog / onRespawn callbacks for integration with cli.js a
+         nd tui.js
+      10 // Storm prevention intentionally halts rather than continuing —
+          if 5 restarts
+     … +254 lines (ctrl+o to expand)
+
+⏺ Now update cli.js to use the supervisor instead of the inline spawnBotDirect:
+
+⏺ Update(cli.js)
+  ⎿  Added 1 line
+      28  const fs         = require('fs')
+      29  const path       = require('path')
+      30  const https      = require('https')
+      31 +const createBotSupervisor = require('./botSupervisor')         
+      32  
+      33  // ── Paths ───────────────────────────────────────────────────
+          ─────────────────
+      34  const ROOT       = __dirname
+
+⏺ Update(cli.js)
+  ⎿  Added 18 lines, removed 1 line
+       86  const state = {
+       87    serverProc: null,
+       88    serverLogPath: path.join(LOG_DIR, 'server.log'),
+       89 -  bots: new Map(),  // name → { proc, model, logPath, startedA
+          -t }                                                           
+       89 +  bots: new Map(),  // name → { proc, model, logPath, startedA
+          +t } (legacy shape kept for status display)                    
+       90  }
+       91  
+       92 +const supervisor = createBotSupervisor({                      
+       93 +  botDir: BOT_DIR,                                            
+       94 +  logDir: LOG_DIR,                                            
+       95 +  onLog: (entry) => {                                         
+       96 +    const clr = entry.level === 'error' ? c.red : entry.level 
+          +=== 'warn' ? c.yellow : c.dim                                 
+       97 +    console.log(tag(clr, `[supervisor] ${entry.msg}`), entry) 
+       98 +  },                                                          
+       99 +  onRespawn: ({ name, chainId, restartCount }) => {           
+      100 +    const port = getServerPort()                              
+      101 +    console.log(tag(c.yellow, `[supervisor] Bot "${name}" resp
+          +awning (chain ${chainId}, attempt #${restartCount}) — joining 
+          +localhost:${port}`))                                          
+      102 +  },                                                          
+      103 +  onStorm: ({ name, chainId, restartCount }) => {             
+      104 +    console.log(tag(c.red, `[supervisor] RESTART STORM: bot "$
+          +{name}" restarted ${restartCount}x in 10 min (chain ${chainId}
+          +). Halted — manual restart required.`))                       
+      105 +    state.bots.delete(name)                                   
+      106 +  },                                                          
+      107 +})                                                            
+      108 +                                                              
+      109  // ── Readline ───────────────────────────────────────────────
+           ──────────────────
+      110  const rl = readline.createInterface({ input: process.stdin, ou
+           tput: process.stdout })
+      111  const prompt = (q) => new Promise(res => rl.question(q, res))
+
+⏺ Now replace the old spawnBotDirect and integrate supervisor into spawnBot:
+
+⏺ Update(cli.js)
+  ⎿  Added 4 lines, removed 70 lines
+      291  
+      292  // ── Bot management ─────────────────────────────────────────
+           ──────────────────
+      293  
+      294 -// Programmatic spawn — used by auto-respawn after fatal desyn
+          -c quit.                                                       
+      295 -function spawnBotDirect(name, model) {                        
+      296 -  if (state.bots.has(name)) return  // already running        
+      297 -  const logPath = path.join(LOG_DIR, `bot_${name}.log`)       
+      298 -  const logFd   = fs.openSync(logPath, 'a')  // append so we k
+          -eep the old log                                               
+      299 -                                                              
+      300 -  const proc = spawn('node', ['bot.js'], {                    
+      301 -    cwd: BOT_DIR,                                             
+      302 -    env: { ...process.env, BOT_NAME: name, FEATHERLESS_MODEL: 
+          -model },                                                      
+      303 -    stdio: ['ignore', logFd, logFd],                          
+      304 -  })                                                          
+      305 -                                                              
+      306 -  proc.on('error', (err) => {                                 
+      307 -    console.log(tag(c.red, `Auto-respawn of "${name}" failed: 
+          -${err.message}`))                                             
+      308 -    state.bots.delete(name)                                   
+      309 -  })                                                          
+      310 -                                                              
+      311 -  proc.on('exit', (code) => {                                 
+      312 -    const b = state.bots.get(name)                            
+      313 -    const uptime = b ? Date.now() - b.startedAt : 0           
+      314 -    state.bots.delete(name)                                   
+      315 -    if (b && code !== 0 && code !== null) {                   
+      316 -      console.log(tag(c.red, `Bot "${name}" crashed on respawn
+          - (code ${code}). Manual restart required.`))                  
+      317 -      tailLog(logPath)                                        
+      318 -    } else if (b && code === 0 && uptime > 60000) {           
+      319 -      console.log(tag(c.yellow, `Bot "${name}" disconnected ag
+          -ain — auto-respawning...`))                                   
+      320 -      spawnBotDirect(name, model)                             
+      321 -    } else {                                                  
+      322 -      console.log(tag(c.gray, `Bot "${name}" stopped`))       
+      323 -    }                                                         
+      324 -  })                                                          
+      325 -                                                              
+      326 -  state.bots.set(name, { proc, model, logPath, startedAt: Date
+          -.now() })                                                     
+      327 -  const port = getServerPort()                                
+      328 -  console.log(tag(c.green, `Bot "${name}" respawned — joining 
+          -localhost:${port} with ${model}`))                            
+      329 -}                                                             
+      330 -                                                              
+      294  async function spawnBot() {
+      295    const name = (await prompt(`${c.bold}Bot name${c.reset} (def
+           ault Ember): `)).trim() || 'Ember'
+      296  
+      334 -  if (state.bots.has(name)) {                                 
+      335 -    console.log(tag(c.red, `A bot named "${name}" is already r
+          -unning.`))                                                    
+      297 +  if (supervisor.has(name)) {                                 
+      298 +    console.log(tag(c.red, `A bot named "${name}" is already m
+          +anaged by the supervisor.`))                                  
+      299      return
+      300    }
+      301  
+     ...
+      315    if (!model) { console.log(tag(c.red, 'Invalid selection.'));
+            return }
+      316  
+      317    const logPath = path.join(LOG_DIR, `bot_${name}.log`)
+      355 -  const logFd = fs.openSync(logPath, 'w')                     
+      318  
+      357 -  const proc = spawn('node', ['bot.js'], {                    
+      358 -    cwd: BOT_DIR,                                             
+      359 -    env: { ...process.env, BOT_NAME: name, FEATHERLESS_MODEL: 
+          -model },                                                      
+      360 -    stdio: ['ignore', logFd, logFd],                          
+      361 -  })                                                          
+      319 +  supervisor.launch(name, model, logPath, { fresh: true })    
+      320  
+      363 -  proc.on('error', (err) => {                                 
+      364 -    console.log(tag(c.red, `Failed to start bot "${name}": ${e
+          -rr.message}`))                                                
+      365 -    state.bots.delete(name)                                   
+      366 -  })                                                          
+      367 -                                                              
+      368 -  proc.on('exit', (code) => {                                 
+      369 -    const b = state.bots.get(name)                            
+      370 -    const uptime = b ? Date.now() - b.startedAt : 0           
+      371 -    state.bots.delete(name)                                   
+      372 -                                                              
+      373 -    if (b && code !== 0 && code !== null) {                   
+      374 -      console.log(tag(c.red, `Bot "${name}" crashed (code ${co
+          -de}). Last log output:`))                                     
+      375 -      tailLog(logPath)                                        
+      376 -    } else if (b && code === 0 && uptime > 60000) {           
+      377 -      // Clean exit after >60s uptime — likely a fatal desync 
+          -quit from fatalDesyncRecovery.js.                             
+      378 -      // Auto-respawn so the bot recovers without manual inter
+          -vention.                                                      
+      379 -      console.log(tag(c.yellow, `Bot "${name}" disconnected (f
+          -atal desync) — auto-respawning...`))                          
+      380 -      spawnBotDirect(name, b.model)                           
+      381 -    } else {                                                  
+      382 -      console.log(tag(c.gray, `Bot "${name}" stopped`))       
+      383 -    }                                                         
+      384 -  })                                                          
+      385 -                                                              
+      386 -  state.bots.set(name, { proc, model, logPath, startedAt: Date
+          -.now() })                                                     
+      387 -                                                              
+      321    const port = getServerPort()
+      322    console.log(tag(c.green, `Bot "${name}" started — joining lo
+           calhost:${port} with ${model}`))
+      323    console.log(tag(c.dim, `Logs: ${logPath}`))
+      324 +  console.log(tag(c.dim, 'Supervisor will auto-respawn on disc
+          +onnects with exponential backoff.'))                          
+      325  }
+      326  
+      327  async function stopBot() {
+
+⏺ Now update stopBot, restartBot, and the status display to use supervisor:
+
+⏺ Update(cli.js)
+  ⎿  Added 15 lines, removed 38 lines
+      325  }
+      326  
+      327  async function stopBot() {
+      328 -  if (state.bots.size === 0) { console.log(tag(c.yellow, 'No b
+          -ots running.')); return }                                     
+      328 +  const sv = supervisor.getState()                            
+      329 +  const names = Object.keys(sv)                               
+      330 +  if (!names.length) { console.log(tag(c.yellow, 'No bots runn
+          +ing.')); return }                                             
+      331  
+      330 -  const names = Array.from(state.bots.keys())                 
+      332    console.log(`${c.bold}Active bots:${c.reset}`)
+      332 -  names.forEach((n, i) => console.log(`  ${c.cyan}[${i+1}]${c.
+          -reset} ${n} (${state.bots.get(n).model})`))                   
+      333 +  names.forEach((n, i) => console.log(`  ${c.cyan}[${i+1}]${c.
+          +reset} ${n} (${sv[n].model})`))                               
+      334  
+      335    const idxRaw = await prompt('Select bot # to stop: ')
+      336    const idx = parseInt(idxRaw) - 1
+      337    const name = names[idx]
+      338    if (!name) { console.log(tag(c.red, 'Invalid selection.')); 
+           return }
+      339  
+      339 -  const bot = state.bots.get(name)                            
+      340 -  console.log(tag(c.cyan, `Stopping ${name}...`))             
+      341 -  try { bot.proc.kill('SIGTERM') } catch (e) {                
+      342 -    console.log(tag(c.red, `Failed: ${e.message}`))           
+      343 -  }                                                           
+      340 +  console.log(tag(c.cyan, `Stopping ${name} (supervisor will n
+          +ot respawn)...`))                                             
+      341 +  supervisor.stop(name)                                       
+      342  }
+      343  
+      344  async function restartBot() {
+      347 -  if (state.bots.size === 0) { console.log(tag(c.yellow, 'No b
+          -ots running.')); return }                                     
+      345 +  const sv = supervisor.getState()                            
+      346 +  const names = Object.keys(sv)                               
+      347 +  if (!names.length) { console.log(tag(c.yellow, 'No bots runn
+          +ing.')); return }                                             
+      348  
+      349 -  const names = Array.from(state.bots.keys())                 
+      349    console.log(`${c.bold}Active bots:${c.reset}`)
+      351 -  names.forEach((n, i) => console.log(`  ${c.cyan}[${i+1}]${c.
+          -reset} ${n} (${state.bots.get(n).model})`))                   
+      350 +  names.forEach((n, i) => console.log(`  ${c.cyan}[${i+1}]${c.
+          +reset} ${n} (${sv[n].model})`))                               
+      351  
+      352    const idxRaw = await prompt('Select bot # to restart: ')
+      353    const idx = parseInt(idxRaw) - 1
+      354    const name = names[idx]
+      355    if (!name) { console.log(tag(c.red, 'Invalid selection.')); 
+           return }
+      356  
+      358 -  const oldBot = state.bots.get(name)                         
+      359 -  const model = oldBot.model                                  
+      360 -  console.log(tag(c.cyan, `Restarting ${name}...`))           
+      357 +  const { model } = sv[name]                                  
+      358 +  console.log(tag(c.cyan, `Restarting ${name} (clean chain)...
+          +`))                                                           
+      359  
+      362 -  oldBot.proc.kill('SIGTERM')                                 
+      363 -  await new Promise(res => setTimeout(res, 1500))             
+      360 +  supervisor.stop(name)                                       
+      361 +  await new Promise(r => setTimeout(r, 1500))                 
+      362  
+      363    const logPath = path.join(LOG_DIR, `bot_${name}.log`)
+      366 -  const logFd = fs.openSync(logPath, 'w')                     
+      367 -  const proc = spawn('node', ['bot.js'], {                    
+      368 -    cwd: BOT_DIR,                                             
+      369 -    env: { ...process.env, BOT_NAME: name, FEATHERLESS_MODEL: 
+          -model },                                                      
+      370 -    stdio: ['ignore', logFd, logFd],                          
+      371 -  })                                                          
+      364 +  supervisor.launch(name, model, logPath, { fresh: true })    
+      365  
+      373 -  proc.on('error', (err) => {                                 
+      374 -    console.log(tag(c.red, `Failed to restart "${name}": ${err
+          -.message}`))                                                  
+      375 -    state.bots.delete(name)                                   
+      376 -  })                                                          
+      377 -                                                              
+      378 -  proc.on('exit', (code) => {                                 
+      379 -    if (code !== 0 && code !== null) {                        
+      380 -      console.log(tag(c.red, `Bot "${name}" crashed (code ${co
+          -de}). Last log output:`))                                     
+      381 -      tailLog(logPath)                                        
+      382 -    } else {                                                  
+      383 -      console.log(tag(c.gray, `Bot "${name}" stopped`))       
+      384 -    }                                                         
+      385 -    state.bots.delete(name)                                   
+      386 -  })                                                          
+      387 -                                                              
+      388 -  state.bots.set(name, { proc, model, logPath, startedAt: Date
+          -.now() })                                                     
+      366    const port = getServerPort()
+      367    console.log(tag(c.green, `Bot "${name}" restarted — joining 
+           localhost:${port}`))
+      368  }
+
+⏺ Now update the status header() function to use supervisor state:
+
+⏺ Update(cli.js)
+  ⎿  Added 11 lines, removed 6 lines
+      573    }
+      574    console.log(`${c.bold}Server:${c.reset} ${serverDot} ${serve
+           rInfo}`)
+      575  
+      576 -  console.log(`${c.bold}Bots:${c.reset}   ${state.bots.size ==
+          -= 0 ? c.gray + 'none' + c.reset : ''}`)                       
+      577 -  for (const [name, b] of state.bots) {                       
+      578 -    const uptime = Math.floor((Date.now() - b.startedAt) / 100
+          -0)                                                            
+      579 -    const mins = Math.floor(uptime / 60)                      
+      580 -    const secs = uptime % 60                                  
+      576 +  const sv = supervisor.getState()                            
+      577 +  const svNames = Object.keys(sv)                             
+      578 +  console.log(`${c.bold}Bots:${c.reset}   ${svNames.length ===
+          + 0 ? c.gray + 'none' + c.reset : ''}`)                        
+      579 +  for (const [name, b] of Object.entries(sv)) {               
+      580 +    const uptimeSec = Math.floor((b.uptimeMs || 0) / 1000)    
+      581 +    const mins = Math.floor(uptimeSec / 60)                   
+      582 +    const secs = uptimeSec % 60                               
+      583      const uptimeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs
+           }s`
+      582 -    console.log(`  ${c.green}●${c.reset} ${c.bold}${name}${c.r
+          -eset} ${c.dim}(${b.model}, up ${uptimeStr})${c.reset}`)       
+      584 +    const dot = b.running ? `${c.green}●${c.reset}` : b.awaiti
+          +ngRespawn ? `${c.yellow}○${c.reset}` : `${c.gray}○${c.reset}` 
+      585 +    const restartNote = b.restartCount > 0 ? ` [restarts: ${b.
+          +restartCount}, chain: ${b.chainId}]` : ''                     
+      586 +    const waitNote = b.awaitingRespawn ? ` ${c.yellow}(respawn
+          +ing...)${c.reset}` : ''                                       
+      587 +    console.log(`  ${dot} ${c.bold}${name}${c.reset} ${c.dim}(
+          +${b.model}, up ${uptimeStr}${restartNote})${c.reset}${waitNote
+          +}`)                                                           
+      588    }
+      589    console.log()
+      590  }
+
+⏺ Also update viewLogs and cleanup to use supervisor:
+
+⏺ Update(cli.js)
+  ⎿  Added 1 line, removed 1 line
+      371  async function viewLogs() {
+      372    const sources = []
+      373    if (state.serverProc) sources.push({ label: 'Server', path: 
+           state.serverLogPath })
+      374 -  for (const [name, b] of state.bots) sources.push({ label: `B
+          -ot: ${name}`, path: b.logPath })                              
+      374 +  for (const [name, b] of Object.entries(supervisor.getState()
+          +)) sources.push({ label: `Bot: ${name}`, path: b.logPath })   
+      375  
+      376    if (!sources.length) { console.log(tag(c.yellow, 'No active 
+           processes.')); return }
+      377  
+
+⏺ Update(cli.js)
+  ⎿  Added 2 lines, removed 2 lines
+      632  
+      633  async function cleanup() {
+      634    console.log(tag(c.cyan, 'Shutting down all processes...'))
+      635 -  for (const [name, b] of state.bots) {                       
+      636 -    try { b.proc.kill('SIGTERM') } catch {}                   
+      635 +  for (const name of Object.keys(supervisor.getState())) {    
+      636 +    supervisor.stop(name)                                     
+      637      console.log(tag(c.gray, `  stopped bot ${name}`))
+      638    }
+      639    if (state.serverProc) {
+
+⏺ Now add exit_reason.json writing to bot.js and the post-spawn integrity check.
+   First add the fs + path requires:
+
+⏺ Update(mc-server/bot/bot.js)
+  ⎿  Added 3 lines
+      1  // Load .env from project root before anything else (Featherless
+          API key, model)
+      2  require('./env').loadEnv()
+      3  
+      4 +const fs   = require('fs')                                      
+      5 +const path = require('path')                                    
+      6 +                                                                
+      7  const mineflayer = require('mineflayer')
+      8  const { pathfinder, Movements, goals } = require('mineflayer-pat
+         hfinder')
+      9  const { plugin: pvp } = require('mineflayer-pvp')
+
+⏺ Now add exit_reason.json writing to the shutdown handlers and log the recovery
+   chain ID at spawn:
+⏺ Update(mc-server/bot/bot.js)
+  ⎿  Added 29 lines, removed 2 lines
+      2392    }
+      2393  })
+      2394  
+      2395 +// ── Exit reason persistence ───────────────────────────────
+           +────────────────────                                         
+      2396 +// Written before each exit so botSupervisor.js can classify 
+           +the restart.                                                 
+      2397 +// Consumed (and deleted) by the supervisor on the next launc
+           +h.                                                           
+      2398 +                                                             
+      2399 +const EXIT_REASON_PATH = path.join(__dirname, 'exit_reason.js
+           +on')                                                         
+      2400 +const RECOVERY_CHAIN_ID = process.env.RECOVERY_CHAIN_ID || nu
+           +ll                                                           
+      2401 +                                                             
+      2402 +function writeExitReason(reason) {                           
+      2403 +  try {                                                      
+      2404 +    fs.writeFileSync(EXIT_REASON_PATH, JSON.stringify({      
+      2405 +      reason,                                                
+      2406 +      exitAt:          Date.now(),                           
+      2407 +      livenessState:   liveness?.getState() || null,         
+      2408 +      chainId:         RECOVERY_CHAIN_ID,                    
+      2409 +    }))                                                      
+      2410 +  } catch {}                                                 
+      2411 +}                                                            
+      2412 +                                                             
+      2413  // ── Errors / shutdown ─────────────────────────────────────
+            ────────────────────
+      2414  
+      2415  bot.on('error', err => {
+      2416    log.error('socket_error', { message: err.message })
+      2417  })
+      2418  bot.on('kicked', reason => {
+      2401 -  log.fatal('kicked', { reason: typeof reason === 'string' ? 
+           -reason : JSON.stringify(reason) })                           
+      2419 +  const r = typeof reason === 'string' ? reason : JSON.string
+           +ify(reason)                                                  
+      2420 +  log.fatal('kicked', { reason: r })                         
+      2421 +  writeExitReason('kicked')                                  
+      2422    setTimeout(() => process.exit(0), 200)  // give logger time
+             to flush
+      2423  })
+      2424  bot.on('end', reason => {
+      2405 -  log.warn('disconnected', { reason: String(reason) })       
+      2425 +  const r = String(reason)                                   
+      2426 +  log.warn('disconnected', { reason: r })                    
+      2427 +  const livenessState = liveness?.getState()                 
+      2428 +  const exitClass = (livenessState === 'LIVE_FATAL' || r === 
+           +'disconnect.quitting')                                       
+      2429 +    ? 'entity_desync'                                        
+      2430 +    : 'server_disconnect'                                    
+      2431 +  writeExitReason(exitClass)                                 
+      2432    setTimeout(() => process.exit(0), 200)
+      2433  })
+      2434  
+      2435  process.on('uncaughtException',  err => {
+      2436    log.fatal('uncaught_exception', { message: err.message, sta
+            ck: err.stack })
+      2437    safeChat(`Crash: ${err.message.slice(0,80)}`)
+      2438 +  writeExitReason('crash')                                   
+      2439    setTimeout(() => process.exit(1), 500)
+      2440  })
+      2441  process.on('unhandledRejection', err => {
+
+⏺ Now add the recovery chain ID log and post-spawn integrity check to the spawn
+  handler:
+
+⏺ Update(mc-server/bot/bot.js)
+  ⎿  Added 4 lines
+      169  bot.once('spawn', async () => {
+      170    log.info('spawned', {
+      171      pos: { x: Math.floor(bot.entity.position.x), y: Math.floor
+           (bot.entity.position.y), z: Math.floor(bot.entity.position.z) 
+           },
+      172 +    ...(RECOVERY_CHAIN_ID && { chainId: RECOVERY_CHAIN_ID }), 
+      173    })
+      174 +  if (RECOVERY_CHAIN_ID) {                                    
+      175 +    log.info('recovery_chain_active', { chainId: RECOVERY_CHAI
+          +N_ID })                                                       
+      176 +  }                                                           
+      177    llmEnabled = await checkOllama()
+      178    log.info('llm_check', { model: getModelName(), connected: ll
+           mEnabled })
+      179  
+
+⏺ Now add the post-spawn integrity check after all the startX() calls:
+
+⏺ Update(mc-server/bot/bot.js)
+  ⎿  Added 20 lines
+      201    startFreezeForensics()
+      202    startHealthBeacon()
+      203    createFatalDesyncRecovery(bot, liveness, log)
+      204 +                                                              
+      205 +  // Post-spawn integrity check: confirm entity liveness reach
+          +es LIVE_VALID within 30s.                                     
+      206 +  // A failure here means position/entity data never arrived —
+          + likely a login-phase desync.                                 
+      207 +  const integrityStart = Date.now()                           
+      208 +  const integrityCheck = setInterval(() => {                  
+      209 +    if (liveness.getState() === 'LIVE_VALID') {               
+      210 +      clearInterval(integrityCheck)                           
+      211 +      log.info('spawn_integrity_ok', {                        
+      212 +        checkMs: Date.now() - integrityStart,                 
+      213 +        ...(RECOVERY_CHAIN_ID && { chainId: RECOVERY_CHAIN_ID 
+          +}),                                                           
+      214 +      })                                                      
+      215 +    } else if (Date.now() - integrityStart > 30_000) {        
+      216 +      clearInterval(integrityCheck)                           
+      217 +      log.warn('spawn_integrity_fail', {                      
+      218 +        livenessState: liveness.getState(),                   
+      219 +        checkMs: 30_000,                                      
+      220 +        ...(RECOVERY_CHAIN_ID && { chainId: RECOVERY_CHAIN_ID 
+          +}),                                                           
+      221 +      })                                                      
+      222 +    }                                                         
+      223 +  }, 1_000)                                                   
+      224  })
+      225  
+      226  // ── Reconciliation Watchdog ────────────────────────────────
+           ──────────────────
+
+⏺ Now update tui.js to use the supervisor. Let me first check the relevant
+  sections:
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+⏺ Now I'll update tui.js to use the supervisor:
+
+⏺ Update(tui.js)
+  ⎿  Added 1 line
+      48  const path  = require('path')
+      49  const https = require('https')
+      50  const readline = require('readline')
+      51 +const createBotSupervisor = require('./botSupervisor')         
+      52  
+      53  // ── Paths & constants ───────────────────────────────────────
+          ─────────────────
+      54  const ROOT       = __dirname
+
+⏺ Update(tui.js)
+  ⎿  Added 4 lines, removed 1 line
+      64  const state = {
+      65    serverProc: null,
+      66    serverLogPath: path.join(LOG_DIR, 'server.log'),
+      67 -  bots: new Map(),       // name → { proc, model, logPath, star
+         -tedAt }                                                        
+      67    selectedBot: null,     // name of bot currently displayed in 
+          status panel
+      68    botStates: new Map(),  // name → latest 'state' event from ev
+          ents.jsonl
+      69    eventsFollowOffset: 0, // file position for tail-following ev
+          ents.jsonl
+      70  }
+      71  
+      72 +// Supervisor is initialized after logPanel is available so onL
+         +og can write there.                                            
+      73 +// Declared here; bound below after screen setup.              
+      74 +let supervisor = null                                          
+      75 +                                                               
+      76  // ── Helpers ─────────────────────────────────────────────────
+          ─────────────────
+      77  function getServerPort() {
+      78    try {
+
+⏺ Now find where logPanel is first used and initialize the supervisor after it.
+  Let me find where the blessed screen/panels are set up:
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+⏺ I'll init the supervisor right after the statusBar declaration:
+
+⏺ Update(tui.js)
+  ⎿  Added 21 lines
+      228    padding: { left: 1, right: 1 },
+      229  })
+      230  
+      231 +// ── Supervisor ─────────────────────────────────────────────
+          +──────────────────                                            
+      232 +supervisor = createBotSupervisor({                            
+      233 +  botDir: BOT_DIR,                                            
+      234 +  logDir: LOG_DIR,                                            
+      235 +  onLog: (entry) => {                                         
+      236 +    const clr = entry.level === 'error' ? '{red-fg}' : entry.l
+          +evel === 'warn' ? '{yellow-fg}' : '{gray-fg}'                 
+      237 +    logPanel.log(`${clr}[supervisor] ${entry.msg}{/}`)        
+      238 +  },                                                          
+      239 +  onRespawn: ({ name, chainId, restartCount }) => {           
+      240 +    const port = getServerPort()                              
+      241 +    logPanel.log(`{yellow-fg}[supervisor] Bot "${name}" respaw
+          +ning (chain ${chainId}, attempt #${restartCount}) — localhost:
+          +${port}{/}`)                                                  
+      242 +    refresh()                                                 
+      243 +  },                                                          
+      244 +  onStorm: ({ name, chainId, restartCount }) => {             
+      245 +    logPanel.log(`{red-fg}[supervisor] RESTART STORM: bot "${n
+          +ame}" restarted ${restartCount}x in 10 min (chain ${chainId}).
+          + Halted.{/}`)                                                 
+      246 +    state.botStates.delete(name)                              
+      247 +    if (state.selectedBot === name) state.selectedBot = null  
+      248 +    refresh()                                                 
+      249 +  },                                                          
+      250 +})                                                            
+      251 +                                                              
+      252  // ── Rendering ──────────────────────────────────────────────
+           ──────────────────
+      253  function renderHeader() {
+      254    const port = getServerPort()
+
+⏺ Now update the bot display in renderHeader and the bot action functions:
+
+⏺ Update(tui.js)
+  ⎿  Added 9 lines, removed 5 lines
+      261      serverLine = `{gray-fg}○{/} Server  {gray-fg}stopped{/}`
+      262    }
+      263  
+      264 +  const sv = supervisor ? supervisor.getState() : {}          
+      265 +  const svNames = Object.keys(sv)                             
+      266    let botsLine
+      265 -  if (state.bots.size === 0) {                                
+      267 +  if (!svNames.length) {                                      
+      268      botsLine = '{gray-fg}no bots running{/}'
+      269    } else {
+      270      const items = []
+      269 -    for (const [name, b] of state.bots) {                     
+      270 -      const up = Math.floor((Date.now() - b.startedAt) / 1000)
+      271 +    for (const [name, b] of Object.entries(sv)) {             
+      272 +      const up = Math.floor((b.uptimeMs || 0) / 1000)         
+      273        const upStr = up >= 60 ? `${Math.floor(up / 60)}m${up % 
+           60}s` : `${up}s`
+      272 -      const marker = name === state.selectedBot ? `{green-fg}●
+          -{/}` : `{cyan-fg}●{/}`                                        
+      273 -      items.push(`${marker} {bold}${name}{/bold} {gray-fg}(${b
+          -.model}, ${upStr}){/}`)                                       
+      274 +      const dot = b.running ? (name === state.selectedBot ? `{
+          +green-fg}●{/}` : `{cyan-fg}●{/}`)                             
+      275 +                : b.awaitingRespawn ? `{yellow-fg}○{/}` : `{gr
+          +ay-fg}○{/}`                                                   
+      276 +      const restarts = b.restartCount > 0 ? ` {yellow-fg}[${b.
+          +restartCount}↺]{/}` : ''                                      
+      277 +      items.push(`${dot} {bold}${name}{/bold} {gray-fg}(${b.mo
+          +del}, ${upStr}){/}${restarts}`)                               
+      278      }
+      279      botsLine = items.join('   ')
+      280    }
+
+⏺ Now update actSpawnBot, actStopBot, actRestartBot, and actSwitchBot:
+
+⏺ Update(tui.js)
+  ⎿  Added 26 lines, removed 58 lines
+      587    if (name === null) return
+      588    const botName = name.trim() || 'Ember'
+      589  
+      590 -  if (state.bots.has(botName)) {                              
+      591 -    return modalMessage(`{red-fg}Bot "${botName}" already runn
+          -ing.{/}`, 'red')                                              
+      590 +  if (supervisor.has(botName)) {                              
+      591 +    return modalMessage(`{red-fg}Bot "${botName}" already mana
+          +ged by supervisor.{/}`, 'red')                                
+      592    }
+      593  
+      594    if (!process.env.FEATHERLESS_API_KEY) {
+     ...
+      600    if (!model) return
+      601  
+      602    const logPath = path.join(LOG_DIR, `bot_${botName}.log`)
+      603 -  const logFd = fs.openSync(logPath, 'w')                     
+      604 -  const proc = spawn('node', ['bot.js'], {                    
+      605 -    cwd: BOT_DIR,                                             
+      606 -    env: { ...process.env, BOT_NAME: botName, FEATHERLESS_MODE
+          -L: model },                                                   
+      607 -    stdio: ['ignore', logFd, logFd],                          
+      608 -  })                                                          
+      603 +  supervisor.launch(botName, model, logPath, { fresh: true }) 
+      604  
+      610 -  proc.on('error', (err) => {                                 
+      611 -    logPanel.log(`{red-fg}Bot "${botName}" failed: ${err.messa
+          -ge}{/}`)                                                      
+      612 -    state.bots.delete(botName)                                
+      613 -    refresh()                                                 
+      614 -  })                                                          
+      615 -  proc.on('exit', (code) => {                                 
+      616 -    if (code !== 0 && code !== null) {                        
+      617 -      logPanel.log(`{red-fg}Bot "${botName}" crashed (code ${c
+          -ode}){/}`)                                                    
+      618 -    } else {                                                  
+      619 -      logPanel.log(`{gray-fg}Bot "${botName}" stopped{/}`)    
+      620 -    }                                                         
+      621 -    state.bots.delete(botName)                                
+      622 -    state.botStates.delete(botName)                           
+      623 -    if (state.selectedBot === botName) state.selectedBot = sta
+          -te.bots.keys().next().value || null                           
+      624 -    refresh()                                                 
+      625 -  })                                                          
+      626 -                                                              
+      627 -  state.bots.set(botName, { proc, model, logPath, startedAt: D
+          -ate.now() })                                                  
+      605    state.selectedBot = botName
+      629 -  logPanel.log(`{green-fg}Bot "${botName}" starting with ${mod
+          -el}{/}`)                                                      
+      606 +  logPanel.log(`{green-fg}Bot "${botName}" starting with ${mod
+          +el} (supervised){/}`)                                         
+      607    refresh()
+      608  }
+      609  
+      610  async function actStopBot() {
+      634 -  if (state.bots.size === 0) return modalMessage('{yellow-fg}N
+          -o bots running.{/}')                                          
+      635 -  const items = [...state.bots.entries()].map(([name, b]) => (
+          -{ label: `${name} (${b.model})`, value: name }))              
+      611 +  const sv = supervisor.getState()                            
+      612 +  const names = Object.keys(sv)                               
+      613 +  if (!names.length) return modalMessage('{yellow-fg}No bots r
+          +unning.{/}')                                                  
+      614 +  const items = names.map(n => ({ label: `${n} (${sv[n].model}
+          +)`, value: n }))                                              
+      615    const name = await modalSelect('Stop which bot?', items)
+      616    if (!name) return
+      638 -  const bot = state.bots.get(name)                            
+      639 -  if (!bot) return                                            
+      640 -  try { bot.proc.kill('SIGTERM') } catch (e) {                
+      641 -    return modalMessage(`{red-fg}Kill failed: ${e.message}{/}`
+          -, 'red')                                                      
+      642 -  }                                                           
+      643 -  logPanel.log(`{cyan-fg}Stopping ${name}...{/}`)             
+      617 +  supervisor.stop(name)                                       
+      618 +  state.botStates.delete(name)                                
+      619 +  if (state.selectedBot === name) state.selectedBot = Object.k
+          +eys(supervisor.getState()).find(n => n !== name) || null      
+      620 +  logPanel.log(`{cyan-fg}Stopping ${name} (supervisor disabled
+          +){/}`)                                                        
+      621 +  refresh()                                                   
+      622  }
+      623  
+      624  async function actRestartBot() {
+      647 -  if (state.bots.size === 0) return modalMessage('{yellow-fg}N
+          -o bots running.{/}')                                          
+      648 -  const items = [...state.bots.entries()].map(([name, b]) => (
+          -{ label: `${name} (${b.model})`, value: name }))              
+      625 +  const sv = supervisor.getState()                            
+      626 +  const names = Object.keys(sv)                               
+      627 +  if (!names.length) return modalMessage('{yellow-fg}No bots r
+          +unning.{/}')                                                  
+      628 +  const items = names.map(n => ({ label: `${n} (${sv[n].model}
+          +)`, value: n }))                                              
+      629    const name = await modalSelect('Restart which bot?', items)
+      630    if (!name) return
+      651 -  const old = state.bots.get(name)                            
+      652 -  const model = old.model                                     
+      653 -  try { old.proc.kill('SIGTERM') } catch {}                   
+      631 +  const { model } = sv[name]                                  
+      632 +  supervisor.stop(name)                                       
+      633    await new Promise(r => setTimeout(r, 1500))
+      634  
+      635    const logPath = path.join(LOG_DIR, `bot_${name}.log`)
+      657 -  const logFd = fs.openSync(logPath, 'w')                     
+      658 -  const proc = spawn('node', ['bot.js'], {                    
+      659 -    cwd: BOT_DIR,                                             
+      660 -    env: { ...process.env, BOT_NAME: name, FEATHERLESS_MODEL: 
+          -model },                                                      
+      661 -    stdio: ['ignore', logFd, logFd],                          
+      662 -  })                                                          
+      663 -  proc.on('exit', (code) => {                                 
+      664 -    if (code !== 0 && code !== null) logPanel.log(`{red-fg}Bot
+          - "${name}" crashed (code ${code}){/}`)                        
+      665 -    else logPanel.log(`{gray-fg}Bot "${name}" stopped{/}`)    
+      666 -    state.bots.delete(name)                                   
+      667 -    state.botStates.delete(name)                              
+      668 -    if (state.selectedBot === name) state.selectedBot = state.
+          -bots.keys().next().value || null                              
+      669 -    refresh()                                                 
+      670 -  })                                                          
+      671 -  state.bots.set(name, { proc, model, logPath, startedAt: Date
+          -.now() })                                                     
+      636 +  supervisor.launch(name, model, logPath, { fresh: true })    
+      637 +                                                              
+      638    state.selectedBot = name
+      673 -  logPanel.log(`{green-fg}Bot "${name}" restarted{/}`)        
+      639 +  logPanel.log(`{green-fg}Bot "${name}" restarted (clean chain
+          +){/}`)                                                        
+      640    refresh()
+      641  }
+      642  
+      643  async function actSwitchBot() {
+      678 -  if (state.bots.size === 0) return modalMessage('{yellow-fg}N
+          -o bots running.{/}')                                          
+      679 -  const items = [...state.bots.keys()].map(n => ({ label: n + 
+          -(n === state.selectedBot ? ' (active)' : ''), value: n }))    
+      644 +  const sv = supervisor.getState()                            
+      645 +  const names = Object.keys(sv)                               
+      646 +  if (!names.length) return modalMessage('{yellow-fg}No bots r
+          +unning.{/}')                                                  
+      647 +  const items = names.map(n => ({ label: n + (n === state.sele
+          +ctedBot ? ' (active)' : ''), value: n }))                     
+      648    const name = await modalSelect('Show which bot in status pan
+           el?', items)
+      649    if (!name) return
+      650    state.selectedBot = name
+
+⏺ Now find and update the cleanup/quit handler in tui.js:
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+⏺ Update(tui.js)
+  ⎿  Added 2 lines, removed 2 lines
+      750  // ── Cleanup & quit ─────────────────────────────────────────
+           ──────────────────
+      751  async function quit() {
+      752    refresh('{yellow-fg}Shutting down...{/}')
+      753 -  for (const [, b] of state.bots) {                           
+      754 -    try { b.proc.kill('SIGTERM') } catch {}                   
+      753 +  for (const name of Object.keys(supervisor.getState())) {    
+      754 +    supervisor.stop(name)                                     
+      755    }
+      756    if (state.serverProc) {
+      757      try { state.serverProc.kill('SIGTERM') } catch {}
+
+⏺ Now let me check if there are any remaining state.bots references in tui.js
+  that need fixing:
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+⏺ Update(tui.js)
+  ⎿  Added 1 line, removed 1 line
+      361      statusBar.setContent(`{bold}${message}{/}`)
+      362    } else {
+      363      const port = getServerPort()
+      364 -    const hint = state.bots.size === 0 && !state.serverProc &&
+          - !isPortInUse(port)                                           
+      364 +    const hint = (!supervisor || !Object.keys(supervisor.getSt
+          +ate()).length) && !state.serverProc && !isPortInUse(port)     
+      365        ? '{yellow-fg}Press [1] to start the server, then [3] to
+            spawn a bot.{/}'
+      366        : 'Press a key to act, or [q] to quit.'
+      367      statusBar.setContent(hint)
+
+⏺ Also check the viewLogs equivalent in tui.js:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ Good — log paths are correctly referenced via local variables, not via
+  state.bots. Now write recovery_report.md:
+
+⏺ Write(recovery_report.md)
+  ⎿  Wrote 95 lines to recovery_report.md
+      1 # Recovery Report — Automatic Fatal Desync Recovery
+      2 
+      3 **Date:** 2026-05-08  
+      4 **Status:** Implemented  
+      5 **Phase:** Post-Phase-6 (Supervisor layer)
+      6 
+      7 ---
+      8 
+      9 ## What was implemented
+     … +126 lines (ctrl+o to expand)
+
+⏺ Now let me do a quick sanity check on the files:
+⏺ Bash(node --check /Users/sarthakghosh/projects/project-k/botSupervisor.js &&
+      echo "OK" && node --check /Users/sarthakghosh/projects/project-k/cli.js &&
+       echo "OK" &&…)
+  ⎿  OK
+     OK
+     OK
+     OK
+
+⏺ All clean. Let me verify a few integration points are correct:
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+⏺ One issue — supervisor.getState() doesn't include logPath in the returned
+  shape, but viewLogs in cli.js at line 374 tries to access b.logPath. Let me
+  check what getState returns and fix this:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ logPath is stored in the internal entry but not exposed by getState(). Let me
+  add it:
+  ⎿  Interrupted · What should Claude do instead?
+
+❯ oops go ahead                                                                 
+
+⏺ Update(botSupervisor.js)
+  ⎿  Added 1 line
+      219        out[name] = {
+      220          running:       !!e.proc,
+      221          model:         e.model,
+      222 +        logPath:       e.logPath,                             
+      223          chainId:       e.chainId,
+      224          restartCount:  e.restartCount,
+      225          backoffMs:     e.backoffMs,
+
+⏺ Bash(node --check /Users/sarthakghosh/projects/project-k/botSupervisor.js &&
+      echo "OK")
+  ⎿  OK
+
+⏺ Now commit everything:
+
+⏺ Bash(git add botSupervisor.js recovery_report.md cli.js tui.js
+      mc-server/bot/bot.js && git diff --cached --stat)
+  ⎿   botSupervisor.js     | 237 ++++++++++++++++++++++++++++++++++++++++++
+     +++++++++
+      cli.js               | 170 +++++++++++-------------------------
+     … +4 lines (ctrl+o to expand)
+
+⏺ Bash(git commit -m "$(cat <<'EOF'
+      Supervisor layer: automatic recovery after fatal desync…)
+  ⎿  [main 4767af0] Supervisor layer: automatic recovery after fatal desync
+      5 files changed, 504 insertions(+), 187 deletions(-)
+      create mode 100644 botSupervisor.js
+      create mode 100644 recovery_report.md
+
+⏺ Done. Here's what landed:
+
+  botSupervisor.js — the core new module. Wraps bot spawning with:
+  - Exit reason classification from exit_reason.json → per-class base delays (3s
+   for desync, 45s for server disconnect, etc.)
+  - Exponential backoff: 2× multiplier per consecutive failure, capped at 5
+  minutes
+  - Storm prevention: ≥5 restarts in 10 minutes → halt and call onStorm, require
+   manual intervention
+  - Recovery chain IDs: random hex ID minted per chain, passed as
+  RECOVERY_CHAIN_ID env var so all bot logs for a restart sequence are trivially
+   grep-able
+
+  bot.js — writes exit_reason.json before every exit path
+  (kicked/end/uncaughtException), logs the chain ID at spawn, and runs a
+  30-second post-spawn integrity check that confirms LIVE_VALID was reached
+  after restart.
+
+  cli.js / tui.js — both fully migrated off inline spawnBotDirect to
+  supervisor.launch/stop. Status displays show restart count, chain ID, and a
+  respawn-pending indicator (yellow ○).
+
+✻ Worked for 29s
+
+※ recap: Implemented automatic supervised recovery after fatal desync. All code is committed. Next: push to remote with `git push`. (disable recaps in /config)
+
+❯ You are now implementing the FINAL stabilization phase of the project-k       
+  autonomous Minecraft runtime.                                                 
+                                                                                
+  The runtime already contains:                                                 
+  - task ownership tokens                                                       
+  - movement authority                                                          
+  - freeze detection                                                            
+  - liveness states                                                             
+  - recovery escalation                                                         
+  - reconnect recovery                                                          
+  - structured telemetry                                                        
+  - degraded movement                                                           
+  - runtime supervision                                                         
+                                                                                
+  DO NOT REMOVE OR SIMPLIFY THESE SYSTEMS.                                      
+                                                                                
+  The architecture is already significantly evolved.                            
+  The remaining problem is NOT task corruption anymore.                         
+                                                                                
+  The remaining problem is:                                                     
+  - environmental awareness                                                     
+  - locomotion intelligence                                                     
+  - path safety                                                                 
+  - hazard understanding                                                        
+  - insufficient world perception                                               
+  - reactive blindness                                                          
+                                                                                
+  ==================================================                            
+  CORE REALIZATION                                                              
+  ==================================================                            
+                                                                                
+  The LLM currently acts mostly blind.                                          
+                                                                                
+  It receives:                                                                  
+  - chat                                                                        
+  - goals                                                                       
+  - sparse state                                                                
+  - inventory                                                                   
+  - health                                                                      
+                                                                                
+  BUT it does NOT truly understand:                                             
+  - nearby terrain                                                              
+  - lava proximity                                                              
+  - cliffs                                                                      
+  - water                                                                       
+  - traps                                                                       
+  - movement hazards                                                            
+  - escape routes                                                               
+  - local topology                                                              
+  - spatial danger                                                              
+                                                                                
+  This causes:                                                                  
+  - lava stalls                                                                 
+  - blind walking                                                               
+  - recovery loops                                                              
+  - movement deadlocks                                                          
+  - unsafe paths                                                                
+  - inefficient escape behavior                                                 
+                                                                                
+  The runtime now survives corruption,                                          
+  but the AGENT still lacks environmental intelligence.                         
+                                                                                
+  ==================================================                            
+  PRIMARY OBJECTIVE                                                             
+  ==================================================                            
+                                                                                
+  Build a REAL-TIME ENVIRONMENTAL PERCEPTION LAYER                              
+  for the autonomy runtime.                                                     
+                                                                                
+  The agent must stop behaving blind.                                           
+                                                                                
+  ==================================================                            
+  NEW ARCHITECTURE GOAL                                                         
+  ==================================================                            
+                                                                                
+  The LLM should receive a structured LOCAL WORLD MODEL.                        
+                                                                                
+  NOT screenshots.                                                              
+                                                                                
+  NOT raw chunks.                                                               
+                                                                                
+  Instead:                                                                      
+  - nearby block intelligence                                                   
+  - hazard map                                                                  
+  - traversability map                                                          
+  - spatial summaries                                                           
+  - local entity awareness                                                      
+  - movement affordances                                                        
+  - escape vectors                                                              
+  - terrain risk analysis                                                       
+                                                                                
+  The goal:                                                                     
+  make the runtime spatially aware.                                             
+                                                                                
+  ==================================================                            
+  IMPLEMENT:                                                                    
+  ENVIRONMENT PERCEPTION SYSTEM                                                 
+  ==================================================                            
+                                                                                
+  Create a subsystem that continuously scans nearby world state.                
+                                                                                
+  Radius:                                                                       
+  - configurable                                                                
+  - default 8–16 blocks                                                         
+                                                                                
+  The perception system must build:                                             
+  - local hazard map                                                            
+  - nearby block summary                                                        
+  - safe movement directions                                                    
+  - terrain elevation changes                                                   
+  - trapped-state detection                                                     
+  - locomotion difficulty score                                                 
+  - environmental risk score                                                    
+                                                                                
+  ==================================================                            
+  THE LLM SHOULD RECEIVE:                                                       
+  ==================================================                            
+                                                                                
+  # 1. Nearby Hazard Summary                                                    
+                                                                                
+  Examples:                                                                     
+                                                                                
+  - lava 2 blocks east                                                          
+  - cactus adjacent south                                                       
+  - cliff drop 5 blocks north                                                   
+  - water nearby west                                                           
+  - fire under feet                                                             
+  - suffocation risk overhead                                                   
+  - enclosed space detected                                                     
+  - surrounded by leaves                                                        
+  - deep cave opening nearby                                                    
+                                                                                
+  ==================================================                            
+  # 2. Spatial Block Map                                                        
+                                                                                
+  Provide nearby blocks as structured compressed data.                          
+                                                                                
+  Example:                                                                      
+                                                                                
+  {                                                                             
+    "nearbyBlocks": [                                                           
+      {"type":"lava","dx":2,"dy":-1,"dz":0},                                    
+      {"type":"cactus","dx":-1,"dy":0,"dz":1},                                  
+      {"type":"air","dx":0,"dy":-3,"dz":0},                                     
+      {"type":"stone","dx":1,"dy":0,"dz":0}                                     
+    ]                                                                           
+  }                                                                             
+                                                                                
+  DO NOT dump entire chunks.                                                    
+  Compress intelligently.                                                       
+                                                                                
+  ==================================================                            
+  # 3. Traversability Analysis                                                  
+                                                                                
+  The runtime should classify:                                                  
+  - safe path                                                                   
+  - blocked path                                                                
+  - hazardous path                                                              
+  - climbable                                                                   
+  - fall risk                                                                   
+  - swim risk                                                                   
+  - suffocation risk                                                            
+                                                                                
+  For each direction:                                                           
+  - north                                                                       
+  - south                                                                       
+  - east                                                                        
+  - west                                                                        
+                                                                                
+  Example:                                                                      
+                                                                                
+  {                                                                             
+    "movementOptions": {                                                        
+      "north":"unsafe_lava",                                                    
+      "south":"walkable",                                                       
+      "east":"fall_risk",                                                       
+      "west":"blocked"                                                          
+    }                                                                           
+  }                                                                             
+                                                                                
+  ==================================================                            
+  # 4. Escape Vector System                                                     
+                                                                                
+  The runtime should compute:                                                   
+  - nearest safe position                                                       
+  - safest direction                                                            
+  - hazard gradient                                                             
+  - movement pressure map                                                       
+                                                                                
+  Examples:                                                                     
+  - move west to escape lava                                                    
+  - move uphill from water                                                      
+  - avoid cactus cluster east                                                   
+  - escape enclosed cave south                                                  
+                                                                                
+  ==================================================                            
+  # 5. Runtime Hazard Memory                                                    
+                                                                                
+  The runtime should remember:                                                  
+  - recent lava positions                                                       
+  - repeated trap zones                                                         
+  - dangerous coordinates                                                       
+  - failed path locations                                                       
+  - death locations                                                             
+                                                                                
+  This prevents:                                                                
+  - walking back into lava                                                      
+  - repeating failed recoveries                                                 
+  - oscillation loops                                                           
+                                                                                
+  ==================================================                            
+  # 6. Stuck Classification                                                     
+                                                                                
+  Differentiate:                                                                
+  - movement blocked                                                            
+  - no path                                                                     
+  - lava immobilization                                                         
+  - suffocation                                                                 
+  - unloaded chunks                                                             
+  - pathfinder stall                                                            
+  - collision deadlock                                                          
+  - liquid drag                                                                 
+  - entity desync                                                               
+  - terrain oscillation                                                         
+                                                                                
+  Recovery should depend on cause.                                              
+                                                                                
+  ==================================================                            
+  # 7. Real Movement Recovery                                                   
+                                                                                
+  Current runtime reconnects correctly,                                         
+  but locomotion itself is still weak.                                          
+                                                                                
+  Implement:                                                                    
+  - jump escape attempts                                                        
+  - strafe escape                                                               
+  - reverse movement                                                            
+  - random perturbation                                                         
+  - climb attempts                                                              
+  - block avoidance                                                             
+  - blind hazard exit                                                           
+  - unstuck micro-actions                                                       
+                                                                                
+  The bot should actively TRY to escape.                                        
+                                                                                
+  ==================================================                            
+  # 8. Continuous Local Awareness                                               
+                                                                                
+  The runtime should continuously know:                                         
+  - what block the bot stands on                                                
+  - what blocks surround feet/head/body                                         
+  - whether movement is progressing                                             
+  - whether danger is increasing                                                
+  - whether the bot is sinking/burning/falling                                  
+                                                                                
+  ==================================================                            
+  # 9. LLM Context Upgrade                                                      
+                                                                                
+  The LLM prompt must now include:                                              
+  - environmental state                                                         
+  - hazard state                                                                
+  - nearby entities                                                             
+  - terrain summary                                                             
+  - movement affordances                                                        
+  - safe vectors                                                                
+                                                                                
+  The model must stop making decisions in a spatial vacuum.                     
+                                                                                
+  ==================================================                            
+  # 10. IMPORTANT:                                                              
+  DO NOT SEND RAW VISUAL DATA                                                   
+  ==================================================                            
+                                                                                
+  Do NOT attempt:                                                               
+  - screenshots                                                                 
+  - image models                                                                
+  - frame streaming                                                             
+                                                                                
+  This is inefficient and unnecessary.                                          
+                                                                                
+  Minecraft already exposes:                                                    
+  - world blocks                                                                
+  - coordinates                                                                 
+  - entities                                                                    
+  - physics                                                                     
+  - collisions                                                                  
+                                                                                
+  Use symbolic spatial intelligence instead.                                    
+                                                                                
+  The runtime should behave more like:                                          
+  - a robot navigation stack                                                    
+  than:                                                                         
+  - a vision-language model                                                     
+                                                                                
+  ==================================================                            
+  # 11. HARD REQUIREMENT                                                        
+  ==================================================                            
+                                                                                
+  The runtime must now aggressively avoid:                                      
+  - lava                                                                        
+  - fire                                                                        
+  - cactus                                                                      
+  - deep falls                                                                  
+  - enclosed traps                                                              
+  - repeated hazardous coordinates                                              
+                                                                                
+  It should survive naturally,                                                  
+  not merely reconnect after dying.                                             
+                                                                                
+  ==================================================                            
+  # 12. IMPLEMENT SAFETY-ORIENTED AUTONOMY                                      
+  ==================================================                            
+                                                                                
+  Movement decisions should prioritize:                                         
+  1. survival                                                                   
+  2. escape                                                                     
+  3. stable locomotion                                                          
+  4. safe terrain                                                               
+  5. task completion                                                            
+                                                                                
+  NOT:                                                                          
+  blind goal pursuit.                                                           
+                                                                                
+  ==================================================                            
+  # 13. TELEMETRY                                                               
+  ==================================================                            
+                                                                                
+  Add structured logs:                                                          
+                                                                                
+  - environment_scan                                                            
+  - hazard_detected                                                             
+  - safe_vector_selected                                                        
+  - movement_blocked                                                            
+  - escape_attempt                                                              
+  - escape_success                                                              
+  - terrain_deadlock                                                            
+  - hazard_memory_hit                                                           
+  - locomotion_failure                                                          
+  - environmental_recovery                                                      
+                                                                                
+  ==================================================                            
+  # 14. FINAL OBJECTIVE                                                         
+  ==================================================                            
+                                                                                
+  The runtime should stop behaving like:                                        
+  “a chatbot controlling Minecraft.”                                            
+                                                                                
+  It should behave like:                                                        
+  “an autonomous embodied agent operating inside a physical world.”             
+                                                                                
+  That means:                                                                   
+  - spatial awareness                                                           
+  - hazard understanding                                                        
+  - terrain reasoning                                                           
+  - movement intelligence                                                       
+  - recovery behavior                                                           
+  - environmental adaptation                                                    
+                                                                                
+  ==================================================                            
+  DELIVERABLES                                                                  
+  ==================================================                            
+                                                                                
+  1. Implement environment perception layer                                     
+  2. Implement hazard analysis                                                  
+  3. Implement movement affordance analysis                                     
+  4. Implement escape vector system                                             
+  5. Upgrade LLM context with spatial intelligence                              
+  6. Implement terrain-aware recovery                                           
+  7. Implement hazard memory                                                    
+  8. Produce:                                                                   
+                                                                                
+  environment_runtime_report.md                                                 
+                                                                                
+  The report must explain:                                                      
+  - perception architecture                                                     
+  - environment scanning strategy                                               
+  - movement intelligence model                                                 
+  - hazard classification system                                                
+  - escape algorithms                                                           
+  - runtime integration                                                         
+  - remaining limitations                                                       
+                                                                                
+  ==================================================                            
+  FINAL NOTE                                                                    
+  ==================================================                            
+                                                                                
+  The runtime is already becoming resilient.                                    
+                                                                                
+  Now make it intelligent.                                                      
+
+⏺ Let me read the key files before designing anything.
+
+  Searched for 3 patterns, read 3 files (ctrl+o to expand)
+
+⏺ Good — I have a complete picture. Let me read how buildGroundedState is called
+   and where the LLM is queried:
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+⏺ Now I have everything. This is a large but well-scoped build. I'll create
+  environmentPerception.js, locomotionRecovery.js, then modify state.js, llm.js,
+   and bot.js.
+
+⏺ Write(mc-server/bot/environmentPerception.js)
+  ⎿  Wrote 361 lines to mc-server/bot/environmentPerception.js
+          layer.ronmentPerception.js — Real-time environmental perception
+       2 //
+       4 //   - local hazard map  (fatal/damage/slow/liquid blocks in con
+         figurable radius)
+         locked/fall_risk/unsafe_*)ysis (N/S/E/W classified as walkable/b
+       6 //   - escape vector     (direction with lowest danger score)
+         x 100) hazard memory     (dangerous coordinates, TTL-evicted, ma
+       8 //   - stuck classifier  (lava_immobilization/collision_deadlock
+       9 //   - locomotion risk   (0–10 score)
+      10 //
+     … +403 lines (ctrl+o to expand)
+
+⏺ Write(mc-server/bot/locomotionRecovery.js)
+  ⎿  Wrote 181 lines to mc-server/bot/locomotionRecovery.js
+         rs.locomotionRecovery.js — Terrain-aware physical escape maneuve
+       3 // When the bot is stuck (lava proximity, collision deadlock, te
+       4 // these functions attempt active micro-escapes using direct con
+         trol-state bursts.
+         inder layer.OT use the pathfinder — they operate below the pathf
+       7 // Each function returns a Promise that resolves when the maneuv
+         er completes.
+         an be composedtentionally short-lived (300–700ms each) so they c
+         ent loop.scalating escape sequences without long-blocking the ev
+      10 //
+     … +195 lines (ctrl+o to expand)
+
+⏺ Now update state.js to accept and include perception:
+
+⏺ Update(mc-server/bot/state.js)
+  ⎿  Added 1 line, removed 1 line
+      13    'ravager','shulker','zombified_piglin','enderman',
+      14  ])
+      15  
+      16 -function buildGroundedState(bot, state, memory, anger = new Map
+         -()) {                                                          
+      16 +function buildGroundedState(bot, state, memory, anger = new Map
+         +(), perception = null) {                                       
+      17    const pos = bot.entity.position
+      18  
+      19    // REAL inventory — only what bot.inventory.items() returns r
+          ight now
+
+⏺ Update(mc-server/bot/state.js)  ⎿  Added 4 lines
+      54      .filter(e => e.type === 'object' && e.objectType === 'Item'
+           && e.position.distanceTo(pos) < 20)
+      55    const droppedCount = droppedItems.length
+      56  
+      57 +  // Environmental perception — scan on demand; null if module 
+         +not ready                                                      
+      58 +  const envScan = perception ? perception.scan() : null        
+      59 +                                                               
+      60    return {
+      61      self: {
+      62        hp:     bot.health,                // real Minecraft HP  
+          (0–20)
+     ...
+      73      droppedCount,       // item entities on ground count  — rea
+          l
+      74      anger: Array.from(anger.entries()).map(([name, rec]) => ({ 
+          name, level: rec.level })),
+      75      knownLocations: memory.locations.slice(-5).map(l => ({ name
+          : l.name, pos: l.pos })),
+      76 +    environment: envScan,          // real-time spatial percept
+         +ion (null if unavailable)                                      
+      77    }
+      78  }
+      79  
+
+⏺ Now update llm.js to include spatial awareness in the prompt:
+
+⏺ Update(mc-server/bot/llm.js)
+  ⎿  Added 1 line, removed 1 line
+      13  const USER_AGENT      = 'project-k/1.0 (https://github.com/Syrt
+          hax/project-k)'
+      14  
+      15  function buildPrompt(groundedState, intent, playerMessage, botN
+          ame = 'Ember') {
+      16 -  const { self, inventory, nearbyBlocks, entities, hostileMobs,
+         - droppedCount, knownLocations, anger } = groundedState         
+      16 +  const { self, inventory, nearbyBlocks, entities, hostileMobs,
+         + droppedCount, knownLocations, anger, environment } = groundedS
+         +tate                                                           
+      17  
+      18    const energyLabel   = self.energy < 25 ? 'CRITICAL' : self.en
+          ergy < 60 ? 'hurt' : 'full'
+      19    const hungerLabel   = self.hunger < 25 ? 'STARVING' : self.hu
+          nger < 60 ? 'hungry' : 'fed'
+
+⏺ Update(mc-server/bot/llm.js)
+  ⎿  Added 14 lines
+      29      const m = i.match(/x(\d+)/); return s + (m ? parseInt(m[1])
+           : 0)
+      30    }, 0)
+      31  
+      32 +  // Spatial/environmental context — compact symbolic summary  
+      33 +  const envStr = environment                                   
+      34 +    ? [                                                        
+      35 +        `standing_on:${environment.standingOn}`,               
+      36 +        `hazards:${environment.hazardSummary}`,                
+      37 +        `risk:${environment.locomotionRisk}/10${environment.isE
+         +nclosed ? ' ENCLOSED' : ''}${environment.cliffNearby ? ` cliff-
+         +${environment.cliffDirection}` : ''}`,                         
+      38 +        `N:${environment.traversability?.N||'?'} S:${environmen
+         +t.traversability?.S||'?'} E:${environment.traversability?.E||'?
+         +'} W:${environment.traversability?.W||'?'}`,                   
+      39 +        `escape:${environment.escapeVector?.label||'?'}`,      
+      40 +      ].join(' | ')                                            
+      41 +    : 'unavailable'                                            
+      42 +  const envDanger  = environment?.locomotionRisk >= 7          
+      43 +  const inLava     = environment?.feetBlock === 'lava' || envir
+         +onment?.headBlock === 'lava'                                   
+      44 +  const isEnclosed = environment?.isEnclosed ?? false          
+      45 +                                                               
+      46    return `You are ${botName}, a Minecraft survival bot with a g
+          enuine personality.
+      47  Personality: independent, witty, occasionally sarcastic, but fu
+          ndamentally cooperative.
+      48  You help players when asked — you're not a pushover, but you're
+           not hostile either.
+
+⏺ Now add the spatial awareness section to the prompt itself:
+
+⏺ Update(mc-server/bot/llm.js)
+  ⎿  Added 4 lines
+      62  known locations: ${locsStr}
+      63  players who angered you: ${angerStr}
+      64  
+      65 +=== SPATIAL AWARENESS ===                                      
+      66 +${envStr}${inLava ? '\nWARNING: standing in LAVA — escape immed
+         +iately' : ''}${envDanger && !inLava ? '\nWARNING: high environm
+         +ental risk — prioritize survival' : ''}${isEnclosed ? '\nWARNIN
+         +G: enclosed space detected — escape before other tasks' : ''}  
+      67 +NOTE: Use this spatial data to make safe movement decisions. Ne
+         +ver walk into hazards.                                         
+      68 +                                                               
+      69  === PLAYER MESSAGE ===
+      70  "${playerMessage}"
+      71  intent: ${intent}
+
+⏺ Now add the spatial-aware action hints to the prompt:
+
+⏺ Update(mc-server/bot/llm.js)
+  ⎿  Added 1 line, removed 1 line
+      91  - "mine_block"        → mine a specific block type. Add "target
+          ":"block_name" (e.g. "stone", "iron_ore", "coal_ore"). Auto-equ
+          ips best tool.
+      92  - "eat_food"          → eat from inventory if any food is prese
+          nt.
+      93  - "flee"              → run away from hostile mobs. Use when lo
+          w HP.
+      94 -- "escape"            → climb out of a hole / get unstuck. Pill
+         -ars up or digs to surface.                                     
+      94 +- "escape"            → climb out of a hole / get unstuck. Pill
+         +ars up or digs to surface. USE when enclosed or risk≥7.        
+      95  - "build_house_smart" → build a house. Auto-gathers wood and cr
+          afts planks if needed.
+      96  - "none"              → talking, questions, refusal.
+      97  
+
+⏺ Now wire everything into bot.js. First add the requires and initialization:
+
+⏺ Update(mc-server/bot/bot.js)
+  ⎿  Added 2 lines
+      20  const createMovementController       = require('./movementContr
+          oller')
+      21  const createGoalRegistry             = require('./goalRegistry'
+          )
+      22  const createRecoveryEngine           = require('./recoveryEngin
+          e')
+      23 +const createEnvironmentPerception    = require('./environmentPe
+         +rception')                                                     
+      24 +const createLocomotionRecovery       = require('./locomotionRec
+         +overy')                                                        
+      25  
+      26  // ── Configuration via env ───────────────────────────────────
+          ──────────────────
+      27  const BOT_NAME    = process.env.BOT_NAME    || 'Ember'
+
+⏺ Now add module-level declarations right after let recoveryEngine = null:
+
+⏺ Update(mc-server/bot/bot.js)
+  ⎿  Added 8 lines, removed 2 lines
+      232  //   - goal === 'attacking' but pvp is not engaged
+      233  //   - state has a followTarget but goal is idle (handled by a
+           gent loop's auto-resume too)
+      234  //   - taskBusy stuck true with no watchdog
+      235 -let recoveryAttempts = 0                                      
+      236 -let recoveryEngine   = null  // initialized in spawn handler a
+          -fter task functions are available                             
+      235 +let recoveryAttempts    = 0                                   
+      236 +let recoveryEngine      = null  // initialized in spawn handle
+          +r after task functions are available                          
+      237 +let envPerception       = null  // initialized in spawn handle
+          +r                                                             
+      238 +let locomotionRecovery  = null  // initialized in spawn handle
+          +r                                                             
+      239  
+      240 +// Last full environment scan — refreshed every PERCEPTION_INT
+          +ERVAL_MS                                                      
+      241 +let lastEnvScan         = null                                
+      242 +const PERCEPTION_INTERVAL_MS = 3000  // scan every 3s; scannin
+          +g is cheap (local blockAt calls)                              
+      243 +                                                              
+      244  function startReconciliationWatchdog() {
+      245    setInterval(() => {
+      246      const findings = []
+
+⏺ Initialize them in the spawn handler and start the perception loop:
+
+⏺ Update(mc-server/bot/bot.js)
+  ⎿  Added 3 lines
+      194      taskExplore,
+      195    })
+      196  
+      197 +  envPerception      = createEnvironmentPerception(bot, log)  
+      198 +  locomotionRecovery = createLocomotionRecovery(bot, log)     
+      199 +                                                              
+      200    startStateLoop()
+      201    startAgentLoop()
+      202    startThreatLoop()
+
+⏺ Add the perception loop call:
+
+⏺ Update(mc-server/bot/bot.js)
+  ⎿  Added 1 line
+      205    startReconciliationWatchdog()
+      206    startFreezeForensics()
+      207    startHealthBeacon()
+      208 +  startPerceptionLoop()                                       
+      209    createFatalDesyncRecovery(bot, liveness, log)
+      210  
+      211    // Post-spawn integrity check: confirm entity liveness reach
+           es LIVE_VALID within 30s.
+
+⏺ Now add the startPerceptionLoop function. Let me find where startHealthBeacon
+  ends to insert it right after:
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+⏺ Update(mc-server/bot/bot.js)
+  ⎿  Added 40 lines
+      1927    }, 10_000)
+      1928  }
+      1929  
+      1930 +// ── Perception Loop ───────────────────────────────────────
+           +────────────────────                                         
+      1931 +// Continuously refreshes lastEnvScan so it is available to t
+           +asks, the LLM,                                               
+      1932 +// freeze forensics, and recovery without blocking event loop
+           + with repeated scans.                                        
+      1933 +// Also fires automatic hazard escape when in critical danger
+           + and not already busy.                                       
+      1934 +                                                             
+      1935 +const LAVA_ESCAPE_COOLDOWN_MS = 8000                         
+      1936 +let lastLavaEscapeAt = 0                                     
+      1937 +                                                             
+      1938 +function startPerceptionLoop() {                             
+      1939 +  setInterval(() => {                                        
+      1940 +    if (!envPerception) return                               
+      1941 +    try {                                                    
+      1942 +      lastEnvScan = envPerception.scan()                     
+      1943 +    } catch (e) {                                            
+      1944 +      log.debug('perception_scan_error', { message: e.message
+           + })                                                          
+      1945 +      return                                                 
+      1946 +    }                                                        
+      1947 +                                                             
+      1948 +    // Auto-trigger hazard escape when standing in lava and n
+           +ot already reacting                                          
+      1949 +    if (lastEnvScan.feetBlock === 'lava' || lastEnvScan.headB
+           +lock === 'lava') {                                           
+      1950 +      const now = Date.now()                                 
+      1951 +      if (!taskBusy && now - lastLavaEscapeAt > LAVA_ESCAPE_C
+           +OOLDOWN_MS) {                                                
+      1952 +        lastLavaEscapeAt = now                               
+      1953 +        log.warn('hazard_detected', { type: 'lava', feetBlock
+           +: lastEnvScan.feetBlock })                                   
+      1954 +        locomotionRecovery.runHazardEscape('lava_immobilizati
+           +on', lastEnvScan, 'auto_lava').catch(() => {})               
+      1955 +      }                                                      
+      1956 +    }                                                        
+      1957 +                                                             
+      1958 +    // Log high-risk situations for postmortem visibility    
+      1959 +    if (lastEnvScan.locomotionRisk >= 8) {                   
+      1960 +      log.warn('hazard_detected', {                          
+      1961 +        risk: lastEnvScan.locomotionRisk,                    
+      1962 +        stuckClass: lastEnvScan.stuckClass,                  
+      1963 +        hazardSummary: lastEnvScan.hazardSummary,            
+      1964 +        isEnclosed: lastEnvScan.isEnclosed,                  
+      1965 +      })                                                     
+      1966 +    }                                                        
+      1967 +  }, PERCEPTION_INTERVAL_MS)                                 
+      1968 +}                                                            
+      1969 +                                                             
+      1970  const ACTIVITY_TIMEOUT_MS = 5 * 60 * 1000  // 5 minutes
+      1971  const ACTIVITY_CHECK_INTERVAL_MS = 30 * 1000
+      1972  
+
+⏺ Now pass envPerception to buildGroundedState in all three call sites:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+⏺ Update(mc-server/bot/bot.js)
+  ⎿  Added 3 lines, removed 3 lines
+      1878      return
+      1879    }
+      1880  
+      1881 -  const gs     = buildGroundedState(bot, state, memory, anger
+           -)                                                            
+      1881 +  const gs     = buildGroundedState(bot, state, memory, anger
+           +, envPerception)                                             
+      1882    const choice = selectAutonomousGoal(gs)
+      1883  
+      1884    if (choice) {
+     ...
+      2278        return
+      2279      }
+      2280  
+      2281 -    const groundedState = buildGroundedState(bot, state, memo
+           -ry, anger)                                                   
+      2281 +    const groundedState = buildGroundedState(bot, state, memo
+           +ry, anger, envPerception)                                    
+      2282  
+      2283      let result
+      2284      try {
+     ...
+      2434    else if (cmd === 'collect' || cmd === 'pick up')   { if (!r
+            unTask('collecting', taskCollectNearby)) safeChat("Busy.") }
+      2435    else if (cmd === 'build house')                    { if (!r
+            unTask('building', taskBuildHouseSmart)) safeChat("Busy.") }
+      2436    else if (cmd === 'inventory')                      { const 
+            it = bot.inventory.items(); safeChat(it.length ? it.map(i=>`$
+            {i.name}x${i.count}`).join(', ') : 'Empty.') }
+      2437 -  else if (cmd === 'look around')                    { const 
+           -gs = buildGroundedState(bot, state, memory, anger); safeChat(
+           -`I see: ${chatSummary(gs) || 'nothing'}`) }                  
+      2437 +  else if (cmd === 'look around')                    { const 
+           +gs = buildGroundedState(bot, state, memory, anger, envPercept
+           +ion); safeChat(`I see: ${chatSummary(gs) || 'nothing'}`) }   
+      2438    else {
+      2439      const m = cmd.match(/^craft (.+)$/);    if (m) { if (!run
+            Task('crafting', () => taskCraftItem(m[1]))) safeChat("Busy."
+            ); return }
+      2440      const p = cmd.match(/^place (.+)$/);    if (p) { if (!run
+            Task('placing', () => taskPlaceBlock(p[1].trim()))) safeChat(
+            "Busy."); return }
+
+⏺ Now enhance taskEscape to use perception and locomotion recovery:
+
+⏺ Update(mc-server/bot/bot.js)
+  ⎿  Added 44 lines, removed 11 lines
+      1579    try { p = await awaitValidPosition(2000) }
+      1580    catch (e) { log.warn('escape_skip_invalid_position', { reas
+            on: e.message }); safeChat("Can't escape yet."); return }
+      1581  
+      1582 -  const startY = Math.floor(p.y)                             
+      1582 +  // Get current perception to classify stuck state and orien
+           +t escape                                                     
+      1583 +  const scan = lastEnvScan || (envPerception ? envPerception.
+           +scan() : null)                                               
+      1584 +  const stuckClass = scan?.stuckClass || 'unknown'           
+      1585 +                                                             
+      1586 +  log.info('escape_start', {                                 
+      1587 +    from: { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.f
+           +loor(p.z) },                                                 
+      1588 +    stuckClass,                                              
+      1589 +    locomotionRisk: scan?.locomotionRisk ?? null,            
+      1590 +    hazardSummary:  scan?.hazardSummary  ?? null,            
+      1591 +  })                                                         
+      1592 +  safeChat('Stuck — escaping.')                              
+      1593 +                                                             
+      1594 +  // Phase 1: locomotion micro-escape first (fast, no pathfin
+           +der)                                                         
+      1595 +  if (locomotionRecovery && scan) {                          
+      1596 +    log.info('escape_attempt', { method: 'locomotion_phase', 
+           +stuckClass })                                                
+      1597 +    await locomotionRecovery.runHazardEscape(stuckClass, scan
+           +, 'task_escape')                                             
+      1598 +    await new Promise(r => setTimeout(r, 300))               
+      1599 +  }                                                          
+      1600 +                                                             
+      1601 +  // Re-read position after locomotion phase                 
+      1602 +  const p2 = bot.entity?.position                            
+      1603 +  if (!isValidVec(p2)) {                                     
+      1604 +    log.warn('escape_position_invalid_after_locomotion')     
+      1605 +    return                                                   
+      1606 +  }                                                          
+      1607 +                                                             
+      1608 +  const startY = Math.floor(p2.y)                            
+      1609    const targetY = Math.min(75, startY + 15)
+      1584 -  log.info('escape_start', { from: { x: Math.floor(p.x), y: s
+           -tartY, z: Math.floor(p.z) }, targetY })                      
+      1585 -  safeChat('Stuck — climbing out.')                          
+      1610  
+      1587 -  // Try multiple nearby surface targets — first straight up,
+           - then radial offsets                                         
+      1588 -  const cx = Math.floor(p.x), cz = Math.floor(p.z)           
+      1611 +  // Phase 2: pathfinder escape — prefer escape-vector direct
+           +ion if known                                                 
+      1612 +  const ev = scan?.escapeVector                              
+      1613 +  const cx  = Math.floor(p2.x)                               
+      1614 +  const cz  = Math.floor(p2.z)                               
+      1615 +                                                             
+      1616    const attempts = [
+      1590 -    { x: cx,     z: cz,     y: targetY },                    
+      1617 +    { x: cx, z: cz, y: targetY },  // straight up            
+      1618 +    // Escape-vector-biased targets first                    
+      1619 +    ...(ev ? [                                               
+      1620 +      { x: cx + ev.dx * 6, z: cz + ev.dz * 6, y: targetY },  
+      1621 +      { x: cx + ev.dx * 4, z: cz + ev.dz * 4, y: startY  },  
+      1622 +    ] : []),                                                 
+      1623      { x: cx + 6, z: cz,     y: targetY },
+      1624      { x: cx - 6, z: cz,     y: targetY },
+      1625      { x: cx,     z: cz + 6, y: targetY },
+      1626      { x: cx,     z: cz - 6, y: targetY },
+      1627    ]
+      1628  
+      1597 -  movement.setThinkingTimeout(5000)  // give pathfinder more 
+           -time to plan dig/place                                       
+      1629 +  movement.setThinkingTimeout(5000)                          
+      1630    try {
+      1631      for (const a of attempts) {
+      1632 +      if (!isFiniteNum(a.x) || !isFiniteNum(a.y) || !isFinite
+           +Num(a.z)) continue                                           
+      1633        try {
+      1601 -        await navNear(a.x, a.y, a.z, 3)                      
+      1634 +        await navNear(Math.floor(a.x), Math.floor(a.y), Math.
+           +floor(a.z), 3)                                               
+      1635          const newY = Math.floor(bot.entity.position.y)
+      1603 -        log.info('escape_complete', { reached: a, newY })    
+      1636 +        log.info('escape_complete', { method: 'pathfinder', r
+           +eached: a, newY, stuckClass })                               
+      1637          safeChat('Out!')
+      1638          return
+      1639        } catch (e) {
+     ...
+      1644      movement.restoreThinkingTimeout()
+      1645    }
+      1646  
+      1614 -  // Last resort: dig straight up                            
+      1615 -  log.warn('escape_falling_back_to_dig_up')                  
+      1647 +  // Phase 3: dig up as last resort                          
+      1648 +  log.warn('escape_falling_back_to_dig_up', { stuckClass })  
+      1649    await digUp(12)
+      1650    log.info('escape_complete', { method: 'dig_up', endY: Math.
+            floor(bot.entity.position.y) })
+      1651  }
+
+⏺ Enhance taskBlindSurvival to be perception-aware:
+
+⏺ Update(mc-server/bot/bot.js)
+  ⎿  Added 21 lines, removed 11 lines
+      2023  // This breaks the "validator dead-end" failure where the bot
+             stands still dying
+      2024  // because all damage events are dropped due to stale positio
+            n cache (diagnosis F18).
+      2025  async function taskBlindSurvival() {
+      2026 -  log.warn('blind_survival_start', { livenessState: liveness.
+           -getState() })                                                
+      2027 -  safeChat('Taking hits. Moving blind.')                     
+      2028 -  const angle = Math.random() * Math.PI * 2                  
+      2029 -  try { bot.entity.yaw = angle } catch {}                    
+      2030 -  bot.setControlState('forward', true)                       
+      2031 -  bot.setControlState('sprint', true)                        
+      2032 -  bot.setControlState('jump', true)                          
+      2033 -  await new Promise(r => setTimeout(r, 400))                 
+      2034 -  bot.setControlState('jump', false)                         
+      2035 -  await new Promise(r => setTimeout(r, 1600))                
+      2036 -  bot.clearControlStates()                                   
+      2026 +  const scan  = lastEnvScan || (envPerception ? envPerception
+           +.scan() : null)                                              
+      2027 +  const stuck = scan?.stuckClass || 'unknown'                
+      2028 +  log.warn('blind_survival_start', { livenessState: liveness.
+           +getState(), stuckClass: stuck, risk: scan?.locomotionRisk ?? 
+           +null })                                                      
+      2029 +  safeChat('Taking hits. Moving.')                           
+      2030 +                                                             
+      2031 +  if (locomotionRecovery && scan) {                          
+      2032 +    // Use perception-aware escape rather than random yaw    
+      2033 +    await locomotionRecovery.runHazardEscape(stuck, scan, 'bl
+           +ind_survival')                                               
+      2034 +  } else {                                                   
+      2035 +    // Fallback: random direction sprint                     
+      2036 +    const angle = Math.random() * Math.PI * 2                
+      2037 +    try { bot.entity.yaw = angle } catch {}                  
+      2038 +    bot.setControlState('forward', true)                     
+      2039 +    bot.setControlState('sprint', true)                      
+      2040 +    bot.setControlState('jump', true)                        
+      2041 +    await new Promise(r => setTimeout(r, 400))               
+      2042 +    bot.setControlState('jump', false)                       
+      2043 +    await new Promise(r => setTimeout(r, 1600))              
+      2044 +    bot.clearControlStates()                                 
+      2045 +  }                                                          
+      2046 +                                                             
+      2047    log.info('blind_survival_complete', { livenessState: livene
+            ss.getState() })
+      2048  }
+      2049  
+
+⏺ Now add the perception data to the freeze snapshot and health beacon:
+
+⏺ Update(mc-server/bot/bot.js)  ⎿  Added 6 lines
+      367      recoveryState:    recoveryEngine?.getState() || null,
+      368      movementOwner:    movement.getOwner(),
+      369  
+      370 +    // Environmental perception                               
+      371 +    envRisk:          lastEnvScan?.locomotionRisk ?? null,    
+      372 +    envStuckClass:    lastEnvScan?.stuckClass     ?? null,    
+      373 +    envHazards:       lastEnvScan?.hazardSummary  ?? null,    
+      374 +    envIsEnclosed:    lastEnvScan?.isEnclosed      ?? null,   
+      375 +                                                              
+      376      // Tracing
+      377      cid: ctx?.correlationId || null,
+      378    }
+
+⏺ Add perception to the health beacon:
+
+⏺ Update(mc-server/bot/bot.js)
+  ⎿  Added 3 lines
+      1961        hp:   bot.health,
+      1962        food: bot.food,
+      1963        goal: state.goal,
+      1964 +      envRisk:      lastEnvScan?.locomotionRisk ?? null,     
+      1965 +      envStuck:     lastEnvScan?.stuckClass     ?? null,     
+      1966 +      envHazards:   lastEnvScan?.hazardSummary  ?? null,     
+      1967        cid:  ctx?.correlationId || null,
+      1968      })
+      1969    }, 10_000)
+
+⏺ Also add environmental telemetry to the hazard reaction path. Let me find
+  hazard_identified:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(mc-server/bot/bot.js)
+  ⎿  Added 10 lines, removed 1 line
+      741  
+      742  function reactToEnvironmental(hazard) {
+      743    rememberHazard(hazard)
+      744 -  log.info('hazard_identified', { name: hazard?.name || 'unkno
+          -wn', knownZones: hazardZones.length })                        
+      744 +  // Also record in the environmental perception hazard memory
+          + for path avoidance                                           
+      745 +  if (hazard?.block?.position && envPerception) {             
+      746 +    const hp = hazard.block.position                          
+      747 +    envPerception.recordHazardPosition(hp.x, hp.y, hp.z, 'dama
+          +ge')                                                          
+      748 +  }                                                           
+      749 +  log.info('hazard_detected', {                               
+      750 +    name: hazard?.name || 'unknown',                          
+      751 +    knownZones: hazardZones.length,                           
+      752 +    envRisk: lastEnvScan?.locomotionRisk ?? null,             
+      753 +  })                                                          
+      754    replaceTask('evading', () => taskEvadeHazard(hazard))
+      755  }
+      756  
+
+⏺ Now syntax-check everything:
+
+⏺ Bash(node --check /Users/sarthakghosh/projects/project-k/mc-server/bot/environ
+      mentPerception.js && echo "OK" && node --check
+      /Users/sarthakghosh/projects/project-k/m…)
+  ⎿  OK
+     OK
+     OK
+     … +2 lines (ctrl+o to expand)
+
+⏺ All clean. Now write the report:
+
+⏺ Write(environment_runtime_report.md)
+  ⎿  Wrote 190 lines to environment_runtime_report.md
+       1 # Environment Runtime Report — Spatial Perception Layer
+       2 
+       3 **Date:** 2026-05-08  
+       4 **Status:** Implemented
+       5 
+       6 ---
+       7 
+       8 ## What was built
+       9 
+      10 ### `environmentPerception.js` (NEW)
+     … +242 lines (ctrl+o to expand)
+
+⏺ Bash(git add mc-server/bot/environmentPerception.js
+      mc-server/bot/locomotionRecovery.js mc-server/bot/state.js
+      mc-server/bot/llm.js mc-server/bot/bot.js environment_…)
+  ⎿   environment_runtime_report.md          | 190 +++++++++++++++++
+      mc-server/bot/bot.js                   | 169 ++++++++++++---
+      mc-server/bot/environmentPerception.js | 361 ++++++++++++++++++++++++
+     … +5 lines (ctrl+o to expand)
+
+⏺ Bash(git commit -m "$(cat <<'EOF'
+      Environmental perception layer: spatial awareness and locomotion
+      intelligence…)
+  ⎿  [main cafae2d] Environmental perception layer: spatial awareness and l
+     ocomotion intelligence
+      6 files changed, 898 insertions(+), 31 deletions(-)
+     … +3 lines (ctrl+o to expand)
+
+⏺ Done. Here's what landed:
+
+  ---
+  environmentPerception.js — The bot now reads the world symbolically. Every 3
+  seconds it scans a radius-12 sphere (~2200 block queries, all in-memory),
+  classifying each block into a 4-tier hazard taxonomy and computing:
+  - Traversability for N/S/E/W with a 10-point danger score per direction
+  - Escape vector — the direction with the lowest score, with dx/dz for
+  orientation
+  - Stuck classification — lava_immobilization, collision_deadlock,
+  terrain_deadlock, liquid_drag, etc.
+  - Hazard memory — every hazardous block position is stored with a 5-minute
+  TTL; traversability penalizes directions through known-dangerous coordinates
+  (prevents the "walk into same lava twice" loop)
+
+  locomotionRecovery.js — When the pathfinder can't help (you're in lava, or
+  surrounded), the bot now uses direct control-state bursts: jump → strafe-L →
+  strafe-R → reverse → perturb. runHazardEscape() routes to the optimal maneuver
+   per stuck class and orients toward the perception escape vector first.
+
+  llm.js — The LLM prompt now has a SPATIAL AWARENESS section with compact
+  symbolic output: standing_on:grass | hazards:lava 2m E | risk:6/10 | 
+  N:walkable E:unsafe_lava | escape:west. Severe conditions inject hard warnings
+   the model can't miss.
+
+  bot.js — The auto-lava escape trigger fires within 3 seconds of standing in
+  lava even if no task is running. taskEscape is now three-phase: locomotion
+  micro-escape first, then pathfinder with escape-vector-biased targets, then
+  dig-up last resort. taskBlindSurvival uses runHazardEscape instead of random
+  yaw.
+
+✻ Crunched for 8m 33s
+
+※ recap: Built an environmental perception layer so the bot understands nearby terrain, hazards, and escape routes instead of moving blind. Next: push to remote. (disable recaps in /config)
+
+❯ /effort                                                                       
+  ⎿  Set effort level to xhigh: Deeper reasoning than high, just below maximum
+     (Opus 4.7 only)
+
+※ recap: Building Ember, an autonomous Minecraft agent with resilient runtime and spatial intelligence. Just completed the environmental perception layer giving the bot hazard awareness, terrain analysis, and physical escape maneuvers. Next: push to remote.
+
+❯ /model                                                                        
+  ⎿  Set model to Opus 4.7
+
+❯ IMPORTANT FINAL REQUIREMENT — MANDATORY VALIDATION PHASE                      
+                                                                                
+  At the VERY END of implementation, you MUST enter a strict verification and   
+  validation phase.                                                             
+                                                                                
+  DO NOT assume features work because code was written.                         
+                                                                                
+  You must actively VERIFY whether the runtime now satisfies the user's actual  
+  goals.                                                                        
+                                                                                
+  ==================================================                            
+  USER'S TRUE GOALS                                                             
+  ==================================================                            
+                                                                                
+  The user wants a Minecraft autonomous agent that:                             
+                                                                                
+  - does NOT freeze permanently                                                 
+  - reacts instantly to damage                                                  
+  - survives hazards                                                            
+  - escapes lava/fire/cactus/water/traps                                        
+  - keeps moving intelligently                                                  
+  - recovers from desyncs                                                       
+  - reconnects automatically if needed                                          
+  - handles Minecraft edge cases robustly                                       
+  - interacts reliably with the world                                           
+  - understands nearby terrain and hazards                                      
+  - can use slash commands intelligently                                        
+  - crafts/mines/places/equips/eats reliably                                    
+  - handles dropped items and inventory issues                                  
+  - survives real gameplay conditions                                           
+  - behaves like a persistent autonomous entity                                 
+                                                                                
+  NOT:                                                                          
+  a fragile scripted bot.                                                       
+                                                                                
+  ==================================================                            
+  MANDATORY FINAL VALIDATION                                                    
+  ==================================================                            
+                                                                                
+  After coding, you MUST perform a COMPLETE ARCHITECTURAL AUDIT.                
+                                                                                
+  Create:                                                                       
+                                                                                
+  final_validation_report.md                                                    
+                                                                                
+  ==================================================                            
+  THE REPORT MUST VERIFY:                                                       
+  ==================================================                            
+                                                                                
+  # 1. Freeze Resilience                                                        
+                                                                                
+  Can the runtime:                                                              
+  - detect freezes?                                                             
+  - detect locomotion stalls?                                                   
+  - detect invalid entity state?                                                
+  - recover locally?                                                            
+  - reconnect automatically?                                                    
+  - avoid permanent deadlock?                                                   
+                                                                                
+  Evidence required.                                                            
+                                                                                
+  ==================================================                            
+  # 2. Damage Survival                                                          
+                                                                                
+  Verify:                                                                       
+  - lava reaction                                                               
+  - cactus reaction                                                             
+  - fall damage reaction                                                        
+  - drowning recovery                                                           
+  - suffocation recovery                                                        
+  - fire escape                                                                 
+  - combat reaction                                                             
+  - repeated-hit behavior                                                       
+                                                                                
+  The bot must NOT stand still while dying.                                     
+                                                                                
+  ==================================================                            
+  # 3. Environmental Intelligence                                               
+                                                                                
+  Verify the runtime now understands:                                           
+  - nearby hazards                                                              
+  - terrain                                                                     
+  - movement affordances                                                        
+  - safe directions                                                             
+  - danger zones                                                                
+  - escape vectors                                                              
+                                                                                
+  Show actual perception examples.                                              
+                                                                                
+  ==================================================                            
+  # 4. Edge Case Handling                                                       
+                                                                                
+  Verify:                                                                       
+  - dropped item recovery                                                       
+  - inventory overflow handling                                                 
+  - crafting failure recovery                                                   
+  - pathfinding timeout recovery                                                
+  - chunk unload handling                                                       
+  - reconnect continuity                                                        
+  - teleport handling                                                           
+  - invalid positions                                                           
+  - stale entity recovery                                                       
+  - impossible task recovery                                                    
+                                                                                
+  ==================================================                            
+  # 5. Movement Stability                                                       
+                                                                                
+  Verify:                                                                       
+  - movement ownership works                                                    
+  - no stale movement corruption                                                
+  - no recursive task destruction                                               
+  - no infinite oscillation loops                                               
+  - no pathfinder deadlock                                                      
+                                                                                
+  ==================================================                            
+  # 6. Slash Command Intelligence                                               
+                                                                                
+  Verify:                                                                       
+  - biome locating                                                              
+  - structure locating                                                          
+  - command execution                                                           
+  - permission handling                                                         
+  - safe command usage                                                          
+                                                                                
+  ==================================================                            
+  # 7. Minecraft Interaction Coverage                                           
+                                                                                
+  Verify:                                                                       
+  - mining                                                                      
+  - digging                                                                     
+  - placing                                                                     
+  - crafting                                                                    
+  - equipping                                                                   
+  - eating                                                                      
+  - gathering                                                                   
+  - following                                                                   
+  - exploring                                                                   
+  - fighting                                                                    
+  - escaping                                                                    
+  - swimming                                                                    
+  - climbing                                                                    
+                                                                                
+  ==================================================                            
+  # 8. Recovery Escalation                                                      
+                                                                                
+  Verify:                                                                       
+  - local recovery                                                              
+  - movement rebuild                                                            
+  - path rebuild                                                                
+  - reconnect escalation                                                        
+  - supervised resurrection                                                     
+  - restart cooldown protection                                                 
+                                                                                
+  ==================================================                            
+  # 9. Telemetry & Observability                                                
+                                                                                
+  Verify logs exist for:                                                        
+  - hazard detection                                                            
+  - movement failure                                                            
+  - freeze snapshots                                                            
+  - escape attempts                                                             
+  - recovery escalation                                                         
+  - reconnect recovery                                                          
+  - environment scans                                                           
+  - item recovery                                                               
+  - danger classification                                                       
+                                                                                
+  ==================================================                            
+  # 10. HONEST FAILURE ANALYSIS                                                 
+                                                                                
+  CRITICAL:                                                                     
+  DO NOT falsely claim success.                                                 
+                                                                                
+  If something remains unstable:                                                
+  - explicitly admit it                                                         
+  - explain why                                                                 
+  - classify severity                                                           
+  - explain remaining architectural weakness                                    
+                                                                                
+  DO NOT hide limitations.                                                      
+                                                                                
+  ==================================================                            
+  # 11. STRESS TESTING REQUIREMENT                                              
+                                                                                
+  You MUST reason through and validate scenarios including:                     
+                                                                                
+  - lava trap                                                                   
+  - cactus corridor                                                             
+  - repeated knockback                                                          
+  - drowning                                                                    
+  - inventory full                                                              
+  - missing tools                                                               
+  - unloaded chunks                                                             
+  - teleportation                                                               
+  - path obstruction                                                            
+  - server lag                                                                  
+  - reconnect storms                                                            
+  - repeated damage                                                             
+  - invalid entity state                                                        
+  - long autonomous sessions                                                    
+                                                                                
+  ==================================================                            
+  # 12. FINAL DELIVERY STANDARD                                                 
+                                                                                
+  At the end, answer this directly inside the report:                           
+                                                                                
+  “Would this runtime survive long-term real Minecraft gameplay without         
+  constant manual intervention?”                                                
+                                                                                
+  Then justify the answer technically.                                          
+                                                                                
+  ==================================================                            
+  IMPORTANT                                                                     
+  ==================================================                            
+                                                                                
+  Do NOT optimize for:                                                          
+  “code compiles.”                                                              
+                                                                                
+  Optimize for:                                                                 
+  “runtime survives reality.”                                                   
+                                                                                
+  The user does NOT care about elegant abstractions if the bot still freezes in 
+   lava and dies.                                                               
+                                                                                
+  The final validation phase is REQUIRED.                                       
+  ⎿  You're out of extra usage · resets 8pm (Asia/Calcutta)
+     /upgrade to increase your usage limit.
+
+✻ Worked for 0s

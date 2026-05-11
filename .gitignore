@@ -42,3 +42,7 @@ mc-server/bot/events.jsonl.1
 node_modules/
 package-lock.json
 *.tgz
+
+
+# TUI config (contains API keys)
+.ember-config.json

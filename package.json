@@ -16,10 +16,8 @@
   "license": "ISC",
   "author": "Sarthak G",
   "type": "commonjs",
-  "main": "cli.js",
+  "main": "tui.js",
   "scripts": {
-    "tui": "node tui.js",
-    "cli": "node cli.js",
     "start": "node tui.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },

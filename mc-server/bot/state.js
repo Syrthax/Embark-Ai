@@ -54,8 +54,16 @@ function buildGroundedState(bot, state, memory, anger = new Map(), perception = 
     .filter(e => e.type === 'object' && e.objectType === 'Item' && e.position.distanceTo(pos) < 20)
   const droppedCount = droppedItems.length
 
-  // Environmental perception — scan on demand; null if module not ready
-  const envScan = perception ? perception.scan() : null
+  // Environmental perception — scan on demand; null if unavailable or errors
+  let envScan = null
+  if (perception) {
+    try {
+      envScan = perception.scan()
+    } catch (err) {
+      // Gracefully degrade if perception scan fails
+      envScan = null
+    }
+  }
 
   return {
     self: {

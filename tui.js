@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-// tui.js — project-k Live Control Dashboard
-// Blessed-based TUI replacing the prompt-driven cli.js.
+// tui.js — project-k Live Control Dashboard (sole entry point)
 //
 // Layout:
 //   ┌─ Header ─────────────────────────────────────────┐
@@ -12,17 +11,18 @@
 //   │ JSONL events,        │ [4] Stop bot              │
 //   │ auto-scrolling       │ [5] Restart bot           │
 //   │                      │ [6] World settings        │
-//   │                      │ [7] Models  [q] Quit      │
+//   │                      │ [7] List models           │
+//   │                      │ [8] Reconfigure           │
+//   │                      │ [q] Quit                  │
 //   └──────────────────────┴───────────────────────────┘
 //
-// Keys:
-//   1-7         action shortcuts
-//   q / Ctrl+C  quit (kills all processes)
-//   Tab         cycle focus between panels
-//   ↑↓ / PgUp/Dn scroll log panel
-//   r           manually refresh status
+// Keys: 1-8 = actions · q/Ctrl+C = quit · Tab = focus cycle
+//       ↑↓/PgUp/Dn = scroll log · r = refresh · s = switch bot
+//
+// First run: onboarding wizard prompts for Ollama or Featherless API setup.
+// Config saved to .ember-config.json (not .env).
 
-// Load .env from project root (FEATHERLESS_API_KEY, FEATHERLESS_MODEL)
+// Load .env from project root if present (optional — config.json is primary)
 function loadDotEnv() {
   const envPath = require('path').join(__dirname, '.env')
   try {
@@ -33,7 +33,8 @@ function loadDotEnv() {
       if (eq === -1) continue
       const key = line.slice(0, eq).trim()
       let value = line.slice(eq + 1).trim()
-      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      if ((value.startsWith('"') && value.endsWith('"')) ||
+          (value.startsWith("'") && value.endsWith("'"))) {
         value = value.slice(1, -1)
       }
       if (process.env[key] === undefined) process.env[key] = value
@@ -44,36 +45,142 @@ loadDotEnv()
 
 const blessed = require('blessed')
 const { spawn, execSync } = require('child_process')
-const fs    = require('fs')
-const path  = require('path')
-const https = require('https')
-const readline = require('readline')
+const fs      = require('fs')
+const os      = require('os')
+const path    = require('path')
+const https   = require('https')
 const createBotSupervisor = require('./botSupervisor')
 
-// ── Paths & constants ────────────────────────────────────────────────────────
-const ROOT       = __dirname
-const SERVER_DIR = path.join(ROOT, 'mc-server')
-const BOT_DIR    = path.join(ROOT, 'mc-server', 'bot')
-const LOG_DIR    = path.join(ROOT, '.cli-logs')
-const SERVER_JAR = 'server.jar'
+// ── Paths & constants ─────────────────────────────────────────────────────────
+const ROOT        = __dirname
+const SERVER_DIR  = path.join(ROOT, 'mc-server')
+const BOT_DIR     = path.join(ROOT, 'mc-server', 'bot')
+const LOG_DIR     = path.join(ROOT, '.cli-logs')
+const CONFIG_FILE = path.join(ROOT, '.ember-config.json')
+const SERVER_JAR  = 'server.jar'
+const MC_VERSION  = '1.21.4'
 const EVENTS_FILE = path.join(BOT_DIR, 'events.jsonl')
 
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true })
 
-// ── Process state ────────────────────────────────────────────────────────────
+// ── Process state ─────────────────────────────────────────────────────────────
 const state = {
-  serverProc: null,
-  serverLogPath: path.join(LOG_DIR, 'server.log'),
-  selectedBot: null,     // name of bot currently displayed in status panel
-  botStates: new Map(),  // name → latest 'state' event from events.jsonl
-  eventsFollowOffset: 0, // file position for tail-following events.jsonl
+  serverProc:         null,
+  serverLogPath:      path.join(LOG_DIR, 'server.log'),
+  selectedBot:        null,
+  botStates:          new Map(),
+  eventsFollowOffset: 0,
 }
 
-// Supervisor is initialized after logPanel is available so onLog can write there.
-// Declared here; bound below after screen setup.
 let supervisor = null
+let appConfig  = null  // loaded by startup()
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Config management ─────────────────────────────────────────────────────────
+function loadConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) }
+  catch { return null }
+}
+
+function saveConfig(cfg) {
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2))
+}
+
+// Sets process.env so the supervisor's spawned bot processes inherit the right vars.
+// Ollama reuses the Featherless-compatible URL env vars — llm.js talks to Ollama's
+// OpenAI-compatible endpoint without any code change.
+function applyConfig(cfg) {
+  if (!cfg) return
+  if (cfg.llmMode === 'ollama') {
+    process.env.FEATHERLESS_URL     = 'http://localhost:11434/v1/chat/completions'
+    process.env.FEATHERLESS_API_KEY = 'ollama'
+    process.env.FEATHERLESS_MODEL   = cfg.ollamaModel || 'llama3.2'
+  } else {
+    delete process.env.FEATHERLESS_URL
+    process.env.FEATHERLESS_API_KEY = cfg.featherlessApiKey || ''
+    process.env.FEATHERLESS_MODEL   = cfg.featherlessModel  || ''
+  }
+}
+
+function configSummary(cfg) {
+  if (!cfg) return '{red-fg}not configured — press [8]{/}'
+  if (cfg.llmMode === 'ollama')
+    return `{green-fg}Ollama{/} {gray-fg}(${cfg.ollamaModel || 'no model'}){/}`
+  return `{cyan-fg}Featherless API{/} {gray-fg}(${cfg.featherlessModel || 'no model'}){/}`
+}
+
+// ── Hardware / Ollama helpers ─────────────────────────────────────────────────
+function detectRAMGB() {
+  return Math.round(os.totalmem() / (1024 ** 3))
+}
+
+function recommendOllamaModel(ramGB) {
+  if (ramGB >= 32) return 'qwen2.5:32b'
+  if (ramGB >= 16) return 'qwen2.5-coder:14b'
+  if (ramGB >= 8)  return 'llama3.2'
+  return 'llama3.2:1b'
+}
+
+function isOllamaInstalled() {
+  try { execSync('ollama --version', { stdio: 'pipe' }); return true }
+  catch { return false }
+}
+
+function getOllamaModels() {
+  try {
+    const out = execSync('ollama list', { stdio: ['pipe', 'pipe', 'pipe'] }).toString()
+    return out.trim().split('\n')
+      .slice(1)
+      .map(l => l.trim().split(/\s+/)[0])
+      .filter(m => m && m !== 'NAME')
+  } catch { return [] }
+}
+
+// ── Featherless model helpers ─────────────────────────────────────────────────
+const FEATHERLESS_DEFAULT_MODELS = [
+  'meta-llama/Meta-Llama-3.1-8B-Instruct',
+  'meta-llama/Meta-Llama-3.1-70B-Instruct',
+  'mistralai/Mistral-7B-Instruct-v0.3',
+  'mistralai/Mixtral-8x7B-Instruct-v0.1',
+  'Qwen/Qwen2.5-7B-Instruct',
+  'Qwen/Qwen2.5-14B-Instruct',
+  'Qwen/Qwen2.5-72B-Instruct',
+  'google/gemma-2-9b-it',
+  'google/gemma-2-27b-it',
+]
+
+function fetchFeatherlessModels() {
+  return new Promise((resolve) => {
+    const apiKey = process.env.FEATHERLESS_API_KEY
+    if (!apiKey || apiKey === 'ollama') { resolve(FEATHERLESS_DEFAULT_MODELS); return }
+    const req = https.request({
+      hostname: 'api.featherless.ai',
+      path: '/v1/models',
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'User-Agent': 'project-k/1.0',
+      },
+      timeout: 3000,
+    }, (res) => {
+      let data = ''
+      res.on('data', d => data += d)
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data)
+          const live = Array.isArray(parsed.data) ? parsed.data.map(m => m.id).filter(Boolean) : []
+          const seen = new Set(FEATHERLESS_DEFAULT_MODELS)
+          const extras = live.filter(id => !seen.has(id)).slice(0, 20)
+          resolve([...FEATHERLESS_DEFAULT_MODELS, ...extras])
+        } catch { resolve(FEATHERLESS_DEFAULT_MODELS) }
+      })
+    })
+    req.on('error', () => resolve(FEATHERLESS_DEFAULT_MODELS))
+    req.on('timeout', () => { req.destroy(); resolve(FEATHERLESS_DEFAULT_MODELS) })
+    req.end()
+  })
+}
+
+// ── Server helpers ────────────────────────────────────────────────────────────
 function getServerPort() {
   try {
     const props = fs.readFileSync(path.join(SERVER_DIR, 'server.properties'), 'utf8')
@@ -90,58 +197,6 @@ function getServerPids(port) {
 }
 
 const isPortInUse = (port) => getServerPids(port).length > 0
-
-// Curated default list (Featherless hosts thousands; these are reliable for JSON output)
-const FEATHERLESS_DEFAULT_MODELS = [
-  'meta-llama/Meta-Llama-3.1-8B-Instruct',
-  'meta-llama/Meta-Llama-3.1-70B-Instruct',
-  'mistralai/Mistral-7B-Instruct-v0.3',
-  'mistralai/Mixtral-8x7B-Instruct-v0.1',
-  'Qwen/Qwen2.5-7B-Instruct',
-  'Qwen/Qwen2.5-14B-Instruct',
-  'Qwen/Qwen2.5-72B-Instruct',
-  'google/gemma-2-9b-it',
-  'google/gemma-2-27b-it',
-]
-
-// Returns models — first tries Featherless API for the live list, falls back to curated.
-function fetchFeatherlessModels() {
-  return new Promise((resolve) => {
-    const apiKey = process.env.FEATHERLESS_API_KEY
-    if (!apiKey) {
-      resolve(FEATHERLESS_DEFAULT_MODELS)
-      return
-    }
-    const req = https.request({
-      hostname: 'api.featherless.ai',
-      path: '/v1/models',
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'User-Agent': 'project-k/1.0',  // Featherless rejects no-UA requests on /models
-      },
-      timeout: 3000,
-    }, (res) => {
-      let data = ''
-      res.on('data', d => data += d)
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data)
-          const live = Array.isArray(parsed.data) ? parsed.data.map(m => m.id).filter(Boolean) : []
-          // Show curated options first (reliable for JSON), then up to 20 more from the live list
-          const seen = new Set(FEATHERLESS_DEFAULT_MODELS)
-          const extras = live.filter(id => !seen.has(id)).slice(0, 20)
-          resolve([...FEATHERLESS_DEFAULT_MODELS, ...extras])
-        } catch {
-          resolve(FEATHERLESS_DEFAULT_MODELS)
-        }
-      })
-    })
-    req.on('error', () => resolve(FEATHERLESS_DEFAULT_MODELS))
-    req.on('timeout', () => { req.destroy(); resolve(FEATHERLESS_DEFAULT_MODELS) })
-    req.end()
-  })
-}
 
 function findJava() {
   const javaVersion = (bin) => {
@@ -169,12 +224,8 @@ function findJava() {
   return 'java'
 }
 
-// ── Blessed screen setup ─────────────────────────────────────────────────────
-const screen = blessed.screen({
-  smartCSR: true,
-  title: 'project-k',
-  fullUnicode: true,
-})
+// ── Blessed screen setup ──────────────────────────────────────────────────────
+const screen = blessed.screen({ smartCSR: true, title: 'project-k', fullUnicode: true })
 
 const header = blessed.box({
   parent: screen,
@@ -228,7 +279,7 @@ const statusBar = blessed.box({
   padding: { left: 1, right: 1 },
 })
 
-// ── Supervisor ───────────────────────────────────────────────────────────────
+// ── Supervisor ────────────────────────────────────────────────────────────────
 supervisor = createBotSupervisor({
   botDir: BOT_DIR,
   logDir: LOG_DIR,
@@ -249,12 +300,12 @@ supervisor = createBotSupervisor({
   },
 })
 
-// ── Rendering ────────────────────────────────────────────────────────────────
+// ── Rendering ─────────────────────────────────────────────────────────────────
 function renderHeader() {
   const port = getServerPort()
   let serverLine
   if (state.serverProc) {
-    serverLine = `{green-fg}●{/} Server  {bold}localhost:${port}{/bold}  (CLI-managed)`
+    serverLine = `{green-fg}●{/} Server  {bold}localhost:${port}{/bold}  (managed)`
   } else if (isPortInUse(port)) {
     serverLine = `{yellow-fg}●{/} Server  {bold}localhost:${port}{/bold}  (external)`
   } else {
@@ -334,14 +385,18 @@ function renderBar(value, max, lowColor, highColor) {
 }
 
 function renderActions() {
+  const modeStr = configSummary(appConfig)
   const lines = [
+    `{bold}AI:{/bold} ${modeStr}`,
+    ``,
     `{bold}{cyan-fg}[1]{/} Start server`,
     `{bold}{cyan-fg}[2]{/} Stop server`,
     `{bold}{cyan-fg}[3]{/} Spawn bot`,
     `{bold}{cyan-fg}[4]{/} Stop bot`,
     `{bold}{cyan-fg}[5]{/} Restart bot`,
     `{bold}{cyan-fg}[6]{/} World settings`,
-    `{bold}{cyan-fg}[7]{/} List Featherless models`,
+    `{bold}{cyan-fg}[7]{/} List models`,
+    `{bold}{cyan-fg}[8]{/} Reconfigure`,
     `{bold}{cyan-fg}[s]{/} Switch active bot`,
     ``,
     `{gray-fg}─── navigation ───{/}`,
@@ -351,7 +406,7 @@ function renderActions() {
     `{cyan-fg}q{/}    quit`,
     ``,
     `{gray-fg}Logs in:{/}`,
-    `{gray-fg}${LOG_DIR.replace(process.env.HOME, '~')}{/}`,
+    `{gray-fg}${LOG_DIR.replace(process.env.HOME || '', '~')}{/}`,
   ]
   actionsPanel.setContent(lines.join('\n'))
 }
@@ -376,14 +431,13 @@ function refresh(message) {
   screen.render()
 }
 
-// ── Live log streaming from events.jsonl ─────────────────────────────────────
+// ── Live log streaming from events.jsonl ──────────────────────────────────────
 function appendLogLine(record) {
   const t = record.ts ? record.ts.slice(11, 19) : ''
   const lvl = record.level
   const colors = { trace: 'gray', debug: 'gray', info: 'cyan', warn: 'yellow', error: 'red', fatal: 'red' }
   const c = colors[lvl] || 'white'
 
-  // 'state' events are tracked but not shown in log (too spammy)
   if (record.event === 'state') {
     if (record.bot) state.botStates.set(record.bot, record)
     if (!state.selectedBot && record.bot) state.selectedBot = record.bot
@@ -402,16 +456,14 @@ function appendLogLine(record) {
 }
 
 function followEvents() {
-  // Tail events.jsonl: read new lines as they're appended
   let lastSize = 0
   try { lastSize = fs.statSync(EVENTS_FILE).size } catch {}
-  state.eventsFollowOffset = lastSize  // start at end (don't replay history)
+  state.eventsFollowOffset = lastSize
 
   const tail = setInterval(() => {
     let stat
     try { stat = fs.statSync(EVENTS_FILE) } catch { return }
     if (stat.size <= state.eventsFollowOffset) {
-      // File rotated/truncated
       if (stat.size < state.eventsFollowOffset) state.eventsFollowOffset = 0
       return
     }
@@ -426,14 +478,14 @@ function followEvents() {
       try {
         const rec = JSON.parse(line)
         appendLogLine(rec)
-      } catch { /* malformed line — skip */ }
+      } catch {}
     }
   }, 500)
 
   return () => clearInterval(tail)
 }
 
-// ── Modal prompts (blocking input via blessed) ───────────────────────────────
+// ── Modal helpers ─────────────────────────────────────────────────────────────
 function modalPrompt(question, defaultValue = '') {
   return new Promise((resolve) => {
     const box = blessed.form({
@@ -445,9 +497,7 @@ function modalPrompt(question, defaultValue = '') {
       keys: true,
       tags: true,
     })
-    blessed.text({
-      parent: box, top: 0, left: 1, content: question,
-    })
+    blessed.text({ parent: box, top: 0, left: 1, content: question })
     const input = blessed.textbox({
       parent: box, top: 2, left: 1, right: 1, height: 1,
       inputOnFocus: true,
@@ -462,7 +512,6 @@ function modalPrompt(question, defaultValue = '') {
 
     input.focus()
     input.readInput()
-
     input.key(['escape'], () => { box.destroy(); screen.render(); resolve(null) })
     input.on('submit', (val) => { box.destroy(); screen.render(); resolve(val) })
     screen.render()
@@ -474,7 +523,7 @@ function modalSelect(title, items) {
     if (items.length === 0) { resolve(null); return }
     const box = blessed.list({
       parent: screen,
-      top: 'center', left: 'center', width: '60%', height: Math.min(items.length + 4, 15),
+      top: 'center', left: 'center', width: '65%', height: Math.min(items.length + 4, 18),
       border: { type: 'line' },
       style: { border: { fg: 'yellow' }, selected: { bg: 'blue', bold: true } },
       label: ` ${title} `,
@@ -496,7 +545,7 @@ function modalSelect(title, items) {
 function modalMessage(text, color = 'cyan') {
   const box = blessed.box({
     parent: screen,
-    top: 'center', left: 'center', width: '50%', height: 'shrink',
+    top: 'center', left: 'center', width: '55%', height: 'shrink',
     border: { type: 'line' },
     style: { border: { fg: color } },
     label: ' Info ',
@@ -510,12 +559,197 @@ function modalMessage(text, color = 'cyan') {
   })
 }
 
-// ── Action handlers ──────────────────────────────────────────────────────────
+// Shows a command to run in a terminal. Enter = done, Esc = cancel.
+function modalCommand(title, instruction, command, note) {
+  return new Promise((resolve) => {
+    const noteBlock = note ? `\n\n{gray-fg}${note}{/}` : ''
+    const content =
+      `{bold}${instruction}{/bold}\n\n` +
+      `{green-fg}{bold}  ${command}{/bold}{/}` +
+      noteBlock +
+      `\n\n{gray-fg}Enter = done  ·  Esc = cancel{/}`
+
+    const noteLines = note ? note.split('\n').length : 0
+    const height = Math.min(8 + noteLines, 18)
+
+    const box = blessed.box({
+      parent: screen,
+      top: 'center', left: 'center', width: '70%', height,
+      border: { type: 'line' },
+      style: { border: { fg: 'yellow' } },
+      label: ` ${title} `,
+      tags: true,
+      content,
+      padding: { left: 2, right: 2, top: 1, bottom: 1 },
+    })
+    screen.render()
+
+    const onKey = (ch, key) => {
+      if (key.name === 'return' || key.name === 'enter') {
+        screen.removeListener('keypress', onKey)
+        box.destroy(); screen.render(); resolve(true)
+      } else if (key.name === 'escape') {
+        screen.removeListener('keypress', onKey)
+        box.destroy(); screen.render(); resolve(false)
+      }
+    }
+    screen.on('keypress', onKey)
+  })
+}
+
+// ── Onboarding wizard ─────────────────────────────────────────────────────────
+async function runOnboarding() {
+  await modalMessage(
+    `{bold}{cyan-fg}Welcome to Ember{/}{/bold}\n\n` +
+    `Ember is an autonomous Minecraft agent powered by AI.\n` +
+    `Let\'s set up your AI backend and verify your server.\n\n` +
+    `{gray-fg}This takes about 2 minutes on first run.{/}`,
+    'cyan'
+  )
+
+  // Step 1: choose backend
+  const mode = await modalSelect('Step 1 of 3 — AI Backend', [
+    { label: 'Ollama          local AI, runs on your machine (free, private)', value: 'ollama' },
+    { label: 'Featherless API cloud AI, no GPU needed (requires API key)',      value: 'featherless' },
+  ])
+  if (!mode) return null
+
+  const cfg = { llmMode: mode }
+
+  // ── Ollama path ──────────────────────────────────────────────────────────────
+  if (mode === 'ollama') {
+
+    // Check installation
+    while (!isOllamaInstalled()) {
+      const ok = await modalCommand(
+        'Install Ollama',
+        'Ollama is not installed. Run this in a separate terminal:',
+        'curl -fsSL https://ollama.com/install.sh | sh',
+        'On macOS with Homebrew: brew install ollama\nPress Enter once installation finishes.',
+      )
+      if (!ok) return null
+      if (!isOllamaInstalled()) {
+        await modalMessage(
+          '{yellow-fg}Ollama still not detected.{/}\nMake sure the installation completed and try again.',
+          'yellow'
+        )
+      }
+    }
+
+    await modalMessage('{green-fg}Ollama detected!{/}', 'green')
+
+    // Check for installed models
+    let models = getOllamaModels()
+
+    if (!models.length) {
+      const ramGB = detectRAMGB()
+      const rec   = recommendOllamaModel(ramGB)
+
+      const MODEL_OPTIONS = [
+        { value: 'llama3.2:1b',        label: 'llama3.2:1b          1.3 GB   (< 4 GB RAM)' },
+        { value: 'llama3.2',            label: 'llama3.2             2.0 GB   (4–8 GB RAM)' },
+        { value: 'qwen2.5-coder:14b',   label: 'qwen2.5-coder:14b   9.0 GB   (16 GB RAM)' },
+        { value: 'qwen2.5:32b',         label: 'qwen2.5:32b         20 GB    (32 GB RAM)' },
+      ].map(o => o.value === rec
+        ? { ...o, label: o.label + '  ← recommended' }
+        : o
+      )
+
+      while (!models.length) {
+        const chosen = await modalSelect(
+          `Step 2 of 3 — Choose Model to Install  (${ramGB} GB RAM detected)`,
+          MODEL_OPTIONS
+        )
+        if (!chosen) return null
+
+        const ok = await modalCommand(
+          'Download Model',
+          `Run in a separate terminal (may take several minutes):`,
+          `ollama pull ${chosen}`,
+          `Wait for "success" to appear, then press Enter.`,
+        )
+        if (!ok) return null
+
+        models = getOllamaModels()
+        if (!models.length) {
+          await modalMessage(
+            '{yellow-fg}No models found yet.{/}\nPlease wait for the download to complete.',
+            'yellow'
+          )
+        }
+      }
+    }
+
+    // Pick from installed models
+    const model = models.length === 1
+      ? models[0]
+      : await modalSelect('Step 2 of 3 — Select Ollama Model', models)
+    if (!model) return null
+
+    cfg.ollamaModel = model
+
+  // ── Featherless path ─────────────────────────────────────────────────────────
+  } else {
+    let apiKey = ''
+    while (!apiKey) {
+      const input = await modalPrompt('Step 2 of 3 — Enter Featherless API key (starts with rc_...):', '')
+      if (input === null) return null
+      apiKey = input.trim()
+      if (!apiKey) await modalMessage('{red-fg}API key cannot be empty.{/}', 'red')
+    }
+    cfg.featherlessApiKey = apiKey
+
+    process.env.FEATHERLESS_API_KEY = apiKey
+    const models = await fetchFeatherlessModels()
+    const model = await modalSelect('Step 2 of 3 — Select Featherless Model', models)
+    if (!model) return null
+    cfg.featherlessModel = model
+  }
+
+  // ── Step 3: Minecraft server check ──────────────────────────────────────────
+  const jarPath = path.join(SERVER_DIR, SERVER_JAR)
+  if (!fs.existsSync(jarPath)) {
+    await modalCommand(
+      `Step 3 of 3 — Minecraft Server  (Java Edition ${MC_VERSION})`,
+      `server.jar not found at mc-server/server.jar`,
+      `mc-server/server.jar`,
+      `Download Minecraft Java Edition ${MC_VERSION} server jar\n` +
+      `from minecraft.net > Download > Minecraft Server\n` +
+      `and place it at the path above.\n\n` +
+      `Press Enter once the file is in place, or Esc to set up later.`,
+    )
+  } else {
+    await modalMessage(
+      `{green-fg}Minecraft server jar found.{/} {gray-fg}(Java Edition ${MC_VERSION}){/}`,
+      'green'
+    )
+  }
+
+  // Save and confirm
+  saveConfig(cfg)
+  const modeLine = cfg.llmMode === 'ollama'
+    ? `Ollama — ${cfg.ollamaModel}`
+    : `Featherless API — ${cfg.featherlessModel}`
+
+  await modalMessage(
+    `{green-fg}{bold}Setup complete!{/}{/bold}\n\n` +
+    `Mode: {bold}${modeLine}{/bold}\n\n` +
+    `Press {cyan-fg}[1]{/} to start the server, then {cyan-fg}[3]{/} to spawn Ember.`,
+    'green'
+  )
+  return cfg
+}
+
+// ── Action handlers ───────────────────────────────────────────────────────────
 async function actStartServer() {
   if (state.serverProc) return modalMessage('{yellow-fg}Server is already running.{/}')
   const jarPath = path.join(SERVER_DIR, SERVER_JAR)
   if (!fs.existsSync(jarPath)) {
-    return modalMessage(`{red-fg}server.jar not found at ${jarPath}{/}`, 'red')
+    return modalMessage(
+      `{red-fg}server.jar not found at mc-server/${SERVER_JAR}{/}\n` +
+      `Run setup again with {cyan-fg}[8]{/} for download instructions.`,
+      'red'
+    )
   }
   const port = getServerPort()
   if (isPortInUse(port)) {
@@ -528,7 +762,10 @@ async function actStartServer() {
     javaVer = m ? parseInt(m[1]) : 0
   } catch {}
   if (javaVer < 21) {
-    return modalMessage(`{red-fg}Java ${javaVer || '?'} found — need Java 21+.{/}\nInstall: brew install openjdk@21`, 'red')
+    return modalMessage(
+      `{red-fg}Java ${javaVer || '?'} found — need Java 21+.{/}\nInstall: brew install openjdk@21`,
+      'red'
+    )
   }
 
   refresh(`{cyan-fg}Starting server with Java ${javaVer}...{/}`)
@@ -538,7 +775,11 @@ async function actStartServer() {
     stdio: ['pipe', logFd, logFd],
   })
   proc.stdin.end()
-  proc.on('error', (err) => { logPanel.log(`{red-fg}server error: ${err.message}{/}`); state.serverProc = null; refresh() })
+  proc.on('error', (err) => {
+    logPanel.log(`{red-fg}server error: ${err.message}{/}`)
+    state.serverProc = null
+    refresh()
+  })
 
   let fullyStarted = false
   const startTimer = setTimeout(() => { fullyStarted = true }, 20000)
@@ -577,27 +818,46 @@ function actStopServer() {
     return
   }
   logPanel.log('{cyan-fg}Stopping server...{/}')
-  try { state.serverProc.kill('SIGTERM') } catch (e) {
-    modalMessage(`{red-fg}Kill failed: ${e.message}{/}`, 'red')
-  }
+  try { state.serverProc.kill('SIGTERM') }
+  catch (e) { modalMessage(`{red-fg}Kill failed: ${e.message}{/}`, 'red') }
 }
 
 async function actSpawnBot() {
+  if (!appConfig) {
+    return modalMessage('{red-fg}Not configured yet.{/}\nPress {cyan-fg}[8]{/} to run the setup wizard.', 'red')
+  }
+
   const name = await modalPrompt('Bot name (default Ember):', 'Ember')
   if (name === null) return
   const botName = name.trim() || 'Ember'
 
   if (supervisor.has(botName)) {
-    return modalMessage(`{red-fg}Bot "${botName}" already managed by supervisor.{/}`, 'red')
+    return modalMessage(`{red-fg}Bot "${botName}" is already running.{/}`, 'red')
   }
 
-  if (!process.env.FEATHERLESS_API_KEY) {
-    return modalMessage(`{red-fg}FEATHERLESS_API_KEY not set in .env{/}\nAdd it to ${path.join(ROOT, '.env')}`, 'red')
+  let model
+  if (appConfig.llmMode === 'ollama') {
+    const models = getOllamaModels()
+    if (!models.length) {
+      return modalMessage(
+        '{red-fg}No Ollama models installed.{/}\nPress {cyan-fg}[8]{/} to run setup and install a model.',
+        'red'
+      )
+    }
+    model = models.length === 1
+      ? models[0]
+      : await modalSelect('Select Ollama Model', models)
+  } else {
+    const models = await fetchFeatherlessModels()
+    model = await modalSelect('Select Featherless Model', models)
   }
-
-  const models = await fetchFeatherlessModels()
-  const model = await modalSelect('Select Featherless model', models)
   if (!model) return
+
+  // Persist last used model and re-apply env so the supervisor spawn gets it
+  if (appConfig.llmMode === 'ollama') appConfig.ollamaModel = model
+  else appConfig.featherlessModel = model
+  saveConfig(appConfig)
+  applyConfig(appConfig)
 
   const logPath = path.join(LOG_DIR, `bot_${botName}.log`)
   supervisor.launch(botName, model, logPath, { fresh: true })
@@ -616,7 +876,8 @@ async function actStopBot() {
   if (!name) return
   supervisor.stop(name)
   state.botStates.delete(name)
-  if (state.selectedBot === name) state.selectedBot = Object.keys(supervisor.getState()).find(n => n !== name) || null
+  if (state.selectedBot === name)
+    state.selectedBot = Object.keys(supervisor.getState()).find(n => n !== name) || null
   logPanel.log(`{cyan-fg}Stopping ${name} (supervisor disabled){/}`)
   refresh()
 }
@@ -631,10 +892,8 @@ async function actRestartBot() {
   const { model } = sv[name]
   supervisor.stop(name)
   await new Promise(r => setTimeout(r, 1500))
-
   const logPath = path.join(LOG_DIR, `bot_${name}.log`)
   supervisor.launch(name, model, logPath, { fresh: true })
-
   state.selectedBot = name
   logPanel.log(`{green-fg}Bot "${name}" restarted (clean chain){/}`)
   refresh()
@@ -644,7 +903,10 @@ async function actSwitchBot() {
   const sv = supervisor.getState()
   const names = Object.keys(sv)
   if (!names.length) return modalMessage('{yellow-fg}No bots running.{/}')
-  const items = names.map(n => ({ label: n + (n === state.selectedBot ? ' (active)' : ''), value: n }))
+  const items = names.map(n => ({
+    label: n + (n === state.selectedBot ? ' (active)' : ''),
+    value: n,
+  }))
   const name = await modalSelect('Show which bot in status panel?', items)
   if (!name) return
   state.selectedBot = name
@@ -652,32 +914,51 @@ async function actSwitchBot() {
 }
 
 async function actListModels() {
-  if (!process.env.FEATHERLESS_API_KEY) {
-    return modalMessage('{red-fg}FEATHERLESS_API_KEY not set in .env{/}', 'red')
+  if (!appConfig) {
+    return modalMessage('{red-fg}Not configured. Press [8] to run setup.{/}', 'red')
   }
-  const models = await fetchFeatherlessModels()
-  if (!models.length) return modalMessage('{red-fg}Could not reach Featherless API.{/}', 'red')
-  const list = models.slice(0, 15).map(m => `  {green-fg}●{/} ${m}`).join('\n')
-  const more = models.length > 15 ? `\n{gray-fg}…and ${models.length - 15} more{/}` : ''
-  await modalMessage(`{bold}Featherless models:{/}\n\n${list}${more}`, 'green')
+  if (appConfig.llmMode === 'ollama') {
+    const models = getOllamaModels()
+    if (!models.length) {
+      return modalMessage('{yellow-fg}No Ollama models installed.{/}\nPress [8] to run setup.', 'yellow')
+    }
+    const list = models.map(m => `  {green-fg}●{/} ${m}`).join('\n')
+    await modalMessage(`{bold}Installed Ollama models:{/}\n\n${list}`, 'green')
+  } else {
+    const models = await fetchFeatherlessModels()
+    if (!models.length) return modalMessage('{red-fg}Could not reach Featherless API.{/}', 'red')
+    const list = models.slice(0, 15).map(m => `  {green-fg}●{/} ${m}`).join('\n')
+    const more = models.length > 15 ? `\n{gray-fg}…and ${models.length - 15} more{/}` : ''
+    await modalMessage(`{bold}Featherless models:{/}\n\n${list}${more}`, 'green')
+  }
 }
 
-// ── World Settings (modal) ───────────────────────────────────────────────────
+async function actReconfigure() {
+  const cfg = await runOnboarding()
+  if (cfg) {
+    appConfig = cfg
+    applyConfig(cfg)
+    logPanel.log(`{green-fg}Reconfigured:{/} ${configSummary(cfg).replace(/\{[^}]+\}/g, '')}`)
+    refresh()
+  }
+}
+
+// ── World Settings ────────────────────────────────────────────────────────────
 const WORLD_DEFS = [
-  { key: 'gamemode', label: 'Game Mode', type: 'cycle',
+  { key: 'gamemode',             label: 'Game Mode',      type: 'cycle',
     options: ['survival','creative','adventure','spectator'] },
-  { key: 'difficulty', label: 'Difficulty', type: 'cycle',
+  { key: 'difficulty',           label: 'Difficulty',     type: 'cycle',
     options: ['peaceful','easy','normal','hard'] },
-  { key: 'pvp', label: 'PVP', type: 'cycle', options: ['true','false'] },
-  { key: 'hardcore', label: 'Hardcore', type: 'cycle', options: ['false','true'] },
-  { key: 'level-type', label: 'World Type', type: 'cycle',
+  { key: 'pvp',                  label: 'PVP',            type: 'cycle', options: ['true','false'] },
+  { key: 'hardcore',             label: 'Hardcore',       type: 'cycle', options: ['false','true'] },
+  { key: 'level-type',           label: 'World Type',     type: 'cycle',
     options: ['minecraft:normal','minecraft:flat','minecraft:large_biomes','minecraft:amplified'] },
-  { key: 'level-seed', label: 'Seed', type: 'text' },
-  { key: 'generate-structures', label: 'Structures', type: 'cycle', options: ['true','false'] },
-  { key: 'max-players', label: 'Max Players', type: 'num', min: 1, max: 200 },
-  { key: 'view-distance', label: 'View Distance', type: 'num', min: 3, max: 32 },
-  { key: 'allow-flight', label: 'Allow Flight', type: 'cycle', options: ['false','true'] },
-  { key: 'spawn-monsters', label: 'Spawn Monsters', type: 'cycle', options: ['true','false'] },
+  { key: 'level-seed',           label: 'Seed',           type: 'text' },
+  { key: 'generate-structures',  label: 'Structures',     type: 'cycle', options: ['true','false'] },
+  { key: 'max-players',          label: 'Max Players',    type: 'num', min: 1,  max: 200 },
+  { key: 'view-distance',        label: 'View Distance',  type: 'num', min: 3,  max: 32 },
+  { key: 'allow-flight',         label: 'Allow Flight',   type: 'cycle', options: ['false','true'] },
+  { key: 'spawn-monsters',       label: 'Spawn Monsters', type: 'cycle', options: ['true','false'] },
   { key: 'enable-command-block', label: 'Command Blocks', type: 'cycle', options: ['true','false'] },
 ]
 
@@ -719,7 +1000,7 @@ async function actWorldSettings() {
       value: def.key,
     }))
     items.push({ label: '── Save & close ──', value: '__save__' })
-    items.push({ label: '── Cancel ──', value: '__cancel__' })
+    items.push({ label: '── Cancel ──',        value: '__cancel__' })
 
     const choice = await modalSelect('World Settings', items)
     if (!choice || choice === '__cancel__') return
@@ -737,7 +1018,9 @@ async function actWorldSettings() {
       const val = await modalPrompt(`${def.label} (current: "${draft[def.key] || 'blank'}")`, draft[def.key] || '')
       if (val !== null) draft[def.key] = val.trim()
     } else if (def.type === 'num') {
-      const val = await modalPrompt(`${def.label} (${def.min}-${def.max}, current: ${draft[def.key]})`, draft[def.key])
+      const val = await modalPrompt(
+        `${def.label} (${def.min}-${def.max}, current: ${draft[def.key]})`, draft[def.key]
+      )
       if (val !== null) {
         const n = parseInt(val.trim())
         if (!isNaN(n) && n >= def.min && n <= def.max) draft[def.key] = String(n)
@@ -747,7 +1030,7 @@ async function actWorldSettings() {
   }
 }
 
-// ── Cleanup & quit ───────────────────────────────────────────────────────────
+// ── Cleanup & quit ────────────────────────────────────────────────────────────
 async function quit() {
   refresh('{yellow-fg}Shutting down...{/}')
   for (const name of Object.keys(supervisor.getState())) {
@@ -761,7 +1044,7 @@ async function quit() {
   process.exit(0)
 }
 
-// ── Key bindings ─────────────────────────────────────────────────────────────
+// ── Key bindings ──────────────────────────────────────────────────────────────
 screen.key(['1'], actStartServer)
 screen.key(['2'], actStopServer)
 screen.key(['3'], actSpawnBot)
@@ -769,22 +1052,48 @@ screen.key(['4'], actStopBot)
 screen.key(['5'], actRestartBot)
 screen.key(['6'], actWorldSettings)
 screen.key(['7'], actListModels)
+screen.key(['8'], actReconfigure)
 screen.key(['s'], actSwitchBot)
 screen.key(['r'], () => refresh())
 screen.key(['q', 'C-c'], quit)
 screen.key(['tab'], () => screen.focusNext())
 
-logPanel.key(['up','down','pageup','pagedown'], () => {})  // enables built-in scroll
+logPanel.key(['up','down','pageup','pagedown'], () => {})
 logPanel.focus()
 
-// ── Initial state & periodic refresh ─────────────────────────────────────────
+// ── Startup ───────────────────────────────────────────────────────────────────
 refresh()
 followEvents()
-setInterval(() => renderHeader() || screen.render(), 1000)  // uptime ticker
+setInterval(() => renderHeader() || screen.render(), 1000)
 
-// Show a welcome line in the log
-logPanel.log('{green-fg}project-k TUI started.{/} Press [3] to spawn a bot, or use number keys for actions.')
-logPanel.log(`{gray-fg}Watching events from: ${EVENTS_FILE}{/}`)
+logPanel.log(`{green-fg}project-k TUI started.{/}  Minecraft ${MC_VERSION}`)
+logPanel.log(`{gray-fg}Watching: ${EVENTS_FILE}{/}`)
+
+async function startup() {
+  appConfig = loadConfig()
+  if (!appConfig) {
+    logPanel.log('{yellow-fg}No configuration found — starting setup wizard...{/}')
+    screen.render()
+    await new Promise(r => setTimeout(r, 400))
+    const cfg = await runOnboarding()
+    if (cfg) {
+      appConfig = cfg
+      applyConfig(cfg)
+      logPanel.log(`{green-fg}Configuration saved.{/}`)
+    } else {
+      logPanel.log('{yellow-fg}Setup cancelled. Press [8] to configure when ready.{/}')
+    }
+  } else {
+    applyConfig(appConfig)
+    const summary = appConfig.llmMode === 'ollama'
+      ? `Ollama (${appConfig.ollamaModel})`
+      : `Featherless API (${appConfig.featherlessModel || 'no model'})`
+    logPanel.log(`{green-fg}Config loaded:{/} {bold}${summary}{/bold}`)
+  }
+  refresh()
+}
 
 process.on('SIGINT', quit)
 process.on('SIGTERM', quit)
+
+startup().catch(err => logPanel.log(`{red-fg}Startup error: ${err.message}{/}`))
