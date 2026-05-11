@@ -1,9 +1,9 @@
 {
-  "name": "project-k",
+  "name": "embark-ai",
   "version": "1.0.0",
-  "description": "Autonomous Minecraft Agent",
+  "description": "Autonomous Minecraft agent powered by Featherless AI or Ollama",
   "keywords": [
-    "project-k"
+    "minecraft", "bot", "ai", "mineflayer", "ollama", "autonomous-agent"
   ],
   "homepage": "https://github.com/Syrthax/project-k#readme",
   "bugs": {
@@ -17,8 +17,20 @@
   "author": "Sarthak G",
   "type": "commonjs",
   "main": "tui.js",
+  "bin": {
+    "embark-ai": "./tui.js"
+  },
+  "files": [
+    "tui.js",
+    "botSupervisor.js",
+    "mc-server/bot/*.js",
+    "mc-server/bot/package.json",
+    "mc-server/server.properties",
+    "README.md"
+  ],
   "scripts": {
     "start": "node tui.js",
+    "postinstall": "cd mc-server/bot && npm install --omit=dev",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {

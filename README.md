@@ -1,4 +1,4 @@
-# Ember — Autonomous Minecraft Agent
+# embark-ai — Autonomous Minecraft Agent
 
 A Minecraft bot that thinks, survives, defends itself, and completes multi-step tasks.
 Built on **Mineflayer** + **Featherless AI** (cloud) or **Ollama** (local LLM). No TypeScript, no databases.
@@ -207,7 +207,7 @@ Config is saved to `.ember-config.json` (gitignored). Press `[8]` in the TUI at 
 ## TUI
 
 ```
-┌─ project-k ─ ● Server localhost:25565 ─ Bots: ● Ember (llama3.2, 142s) ────┐
+┌─ embark-ai ─ ● Server localhost:25565 ─ Bots: ● Ember (llama3.2, 142s) ────┐
 ├─ Bot Status ────────────────────┬─ Actions ──────────────────────────────────┤
 │ Ember                           │ AI: Ollama (llama3.2)                      │
 │                                 │                                            │
@@ -280,7 +280,7 @@ Speak naturally — the LLM interprets intent. Direct commands work too:
 ## File Structure
 
 ```
-project-k/
+embark-ai/
 ├── tui.js                       TUI control panel — server + bot management + onboarding
 ├── botSupervisor.js             Supervised bot lifecycle: backoff, storm protection
 ├── package.json

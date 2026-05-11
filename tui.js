@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// tui.js — project-k Live Control Dashboard (sole entry point)
+// tui.js — embark-ai Live Control Dashboard (sole entry point)
 //
 // Layout:
 //   ┌─ Header ─────────────────────────────────────────┐
@@ -158,7 +158,7 @@ function fetchFeatherlessModels() {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
-        'User-Agent': 'project-k/1.0',
+        'User-Agent': 'embark-ai/1.0',
       },
       timeout: 3000,
     }, (res) => {
@@ -225,7 +225,7 @@ function findJava() {
 }
 
 // ── Blessed screen setup ──────────────────────────────────────────────────────
-const screen = blessed.screen({ smartCSR: true, title: 'project-k', fullUnicode: true })
+const screen = blessed.screen({ smartCSR: true, title: 'embark-ai', fullUnicode: true })
 
 const header = blessed.box({
   parent: screen,
@@ -330,7 +330,7 @@ function renderHeader() {
     botsLine = items.join('   ')
   }
 
-  header.setContent(`{bold}{cyan-fg}project-k{/}{/bold}   ${serverLine}   |   Bots:  ${botsLine}`)
+  header.setContent(`{bold}{cyan-fg}embark-ai{/}{/bold}   ${serverLine}   |   Bots:  ${botsLine}`)
 }
 
 function renderStatus() {
@@ -600,7 +600,7 @@ function modalCommand(title, instruction, command, note) {
 // ── Onboarding wizard ─────────────────────────────────────────────────────────
 async function runOnboarding() {
   await modalMessage(
-    `{bold}{cyan-fg}Welcome to Ember{/}{/bold}\n\n` +
+    `{bold}{cyan-fg}Welcome to embark-ai{/}{/bold}\n\n` +
     `Ember is an autonomous Minecraft agent powered by AI.\n` +
     `Let\'s set up your AI backend and verify your server.\n\n` +
     `{gray-fg}This takes about 2 minutes on first run.{/}`,
@@ -1066,7 +1066,7 @@ refresh()
 followEvents()
 setInterval(() => renderHeader() || screen.render(), 1000)
 
-logPanel.log(`{green-fg}project-k TUI started.{/}  Minecraft ${MC_VERSION}`)
+logPanel.log(`{green-fg}embark-ai started.{/}  Minecraft ${MC_VERSION}`)
 logPanel.log(`{gray-fg}Watching: ${EVENTS_FILE}{/}`)
 
 async function startup() {
