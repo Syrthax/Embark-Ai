@@ -402,11 +402,12 @@ function renderActions() {
     `{gray-fg}─── navigation ───{/}`,
     `{cyan-fg}↑↓{/}   scroll log`,
     `{cyan-fg}Tab{/}  switch focus`,
-    `{cyan-fg}r{/}    refresh status`,
+    `{cyan-fg}r{/}    refresh`,
+    `{cyan-fg}m{/}    toggle selection`,
     `{cyan-fg}q{/}    quit`,
     ``,
-    `{gray-fg}Logs in:{/}`,
-    `{gray-fg}${LOG_DIR}{/}`,
+    `{gray-fg}Logs: ${LOG_DIR}{/}`,
+    `{gray-fg}github.com/Syrthax/Embark-Ai{/}`,
   ]
   actionsPanel.setContent(lines.join('\n'))
 }
@@ -603,8 +604,8 @@ async function runOnboarding() {
     `{bold}{cyan-fg}Welcome to embark-ai{/}{/bold}  {yellow-fg}[beta]{/}\n\n` +
     `Ember is an autonomous Minecraft agent powered by AI.\n` +
     `Let\'s set up your AI backend and verify your server.\n\n` +
-    `{yellow-fg}⚠ This is a beta release — some features may be\n` +
-    `  unstable. Please report issues on GitHub.{/}\n\n` +
+    `{yellow-fg}⚠ Beta release — some features may be unstable.\n` +
+    `  Issues: github.com/Syrthax/Embark-Ai/issues{/}\n\n` +
     `{gray-fg}This takes about 2 minutes on first run.{/}`,
     'cyan'
   )
@@ -1067,6 +1068,22 @@ screen.key(['s'], actSwitchBot)
 screen.key(['r'], () => refresh())
 screen.key(['q', 'C-c'], quit)
 screen.key(['tab'], () => screen.focusNext())
+
+// [m] — toggle mouse capture so the terminal lets you select + copy text.
+// When selection mode is on, TUI mouse clicks are suspended.
+let _mouseEnabled = true
+screen.key(['m'], () => {
+  if (_mouseEnabled) {
+    screen.program.disableMouse()
+    _mouseEnabled = false
+    renderStatusBar('{yellow-fg}Selection mode — click & drag to copy. Press [m] to restore mouse.{/}')
+  } else {
+    screen.program.enableMouse()
+    _mouseEnabled = true
+    renderStatusBar(null)
+  }
+  screen.render()
+})
 
 logPanel.key(['up','down','pageup','pagedown'], () => {})
 logPanel.focus()

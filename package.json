@@ -10,13 +10,13 @@
     "ollama",
     "autonomous-agent"
   ],
-  "homepage": "https://github.com/Syrthax/project-k#readme",
+  "homepage": "https://github.com/Syrthax/Embark-Ai#readme",
   "bugs": {
-    "url": "https://github.com/Syrthax/project-k/issues"
+    "url": "https://github.com/Syrthax/Embark-Ai/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Syrthax/project-k.git"
+    "url": "git+https://github.com/Syrthax/Embark-Ai.git"
   },
   "license": "ISC",
   "author": "Sarthak G",
