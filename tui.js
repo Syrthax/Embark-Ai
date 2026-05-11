@@ -406,7 +406,7 @@ function renderActions() {
     `{cyan-fg}q{/}    quit`,
     ``,
     `{gray-fg}Logs in:{/}`,
-    `{gray-fg}${LOG_DIR.replace(process.env.HOME || '', '~')}{/}`,
+    `{gray-fg}${LOG_DIR}{/}`,
   ]
   actionsPanel.setContent(lines.join('\n'))
 }
@@ -711,8 +711,8 @@ async function runOnboarding() {
   if (!fs.existsSync(jarPath)) {
     await modalCommand(
       `Step 3 of 3 — Minecraft Server  (Java Edition ${MC_VERSION})`,
-      `server.jar not found at mc-server/server.jar`,
-      `mc-server/server.jar`,
+      `server.jar not found. Place it at:`,
+      `${path.join(SERVER_DIR, SERVER_JAR)}`,
       `Download Minecraft Java Edition ${MC_VERSION} server jar\n` +
       `from minecraft.net > Download > Minecraft Server\n` +
       `and place it at the path above.\n\n` +
@@ -746,7 +746,7 @@ async function actStartServer() {
   const jarPath = path.join(SERVER_DIR, SERVER_JAR)
   if (!fs.existsSync(jarPath)) {
     return modalMessage(
-      `{red-fg}server.jar not found at mc-server/${SERVER_JAR}{/}\n` +
+      `{red-fg}server.jar not found at:{/}\n${path.join(SERVER_DIR, SERVER_JAR)}\n` +
       `Run setup again with {cyan-fg}[8]{/} for download instructions.`,
       'red'
     )
