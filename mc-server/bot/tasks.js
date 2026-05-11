@@ -238,6 +238,9 @@ module.exports = function createTasks(deps) {
     const fresh = bot.blockAt(logBlock.position)
     if (fresh && ids.includes(fresh.type) && bot.canDigBlock(fresh)) {
       await safeDig(bot, fresh)
+      // Step into the drop so the item entity is auto-collected
+      await new Promise(r => setTimeout(r, 300))
+      try { await navNear(logBlock.position.x, logBlock.position.y, logBlock.position.z, 0) } catch {}
       safeChat('Got wood.')
       rememberEvent(memory, 'gathered_wood', {})
     }
@@ -909,6 +912,8 @@ module.exports = function createTasks(deps) {
           const fresh = bot.blockAt(logBlock.position)
           if (fresh && ids.includes(fresh.type)) {
             await safeDig(bot, fresh)
+            await new Promise(r => setTimeout(r, 300))
+            try { await navNear(logBlock.position.x, logBlock.position.y, logBlock.position.z, 0) } catch {}
             chopped++
           } else { break }
         } catch (e) {
